@@ -282,7 +282,7 @@ def load_all_training_data(max_per_type=250):
 
 # ── TRAINING LOOP ─────────────────────────────
 
-def train(epochs=500, batch_size=16):
+def train(epochs=1000, batch_size=32):
     print("\n" + "="*55)
     print("UNIVERSAL FOUNDATION TRAINER v5.2")
     print("Training on: Images + Video + Audio + Documents")
@@ -395,4 +395,4 @@ if __name__ == "__main__":
         generate_documents(target=1000)
         print("\nAll data ready. Delete weights to retrain.")
     else:
-        train(epochs=500, batch_size=16)
+        train(epochs=1000, batch_size=16)
