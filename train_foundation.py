@@ -1,16 +1,16 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 import os
 import requests
 import tempfile
 
 # ============================================
-# UNIVERSAL FOUNDATION TRAINER v5
-# Trains the complete v5 architecture
-# Includes morphogenetic decoder + pathways
-# Run this ONCE to build the shared foundation
+# UNIVERSAL FOUNDATION TRAINER v5.2
+# Trains on ALL file types:
+# Images, Video frames, Audio spectrograms,
+# Documents — 1000+ per type
 # Inventor: Rohit Kalu Sasane, Pune India 2026
 # ============================================
 
@@ -19,8 +19,9 @@ IMAGE_SIZE = 256
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+# ── ARCHITECTURE — must match foundation_v4.py ─
+
 class GlobalEncoder(nn.Module):
-    """Claim 8 — Global context encoder (coarsest level)"""
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
@@ -28,15 +29,12 @@ class GlobalEncoder(nn.Module):
             nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(64, 128, 4, stride=2, padding=1), nn.ReLU(),
             nn.AdaptiveAvgPool2d(4), nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 32)
+            nn.Linear(128*4*4, 32)
         )
-
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
 
 class RegionalEncoder(nn.Module):
-    """Claim 8 — Regional context encoder (mid level)"""
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
@@ -44,235 +42,357 @@ class RegionalEncoder(nn.Module):
             nn.Conv2d(64, 128, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(128, 256, 4, stride=2, padding=1), nn.ReLU(),
             nn.AdaptiveAvgPool2d(4), nn.Flatten(),
-            nn.Linear(256 * 4 * 4, 256)
+            nn.Linear(256*4*4, 256)
         )
-
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
 
 class DetailEncoder(nn.Module):
-    """Claim 8 — Fine detail encoder (finest level)"""
     def __init__(self):
         super().__init__()
-        # AdaptiveAvgPool2d(8) makes the linear size input-resolution-safe
         self.net = nn.Sequential(
             nn.Conv2d(3, 64, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(64, 128, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(128, 256, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(256, 512, 4, stride=2, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(8), nn.Flatten(),       # FIX: was fragile hardcoded 16x16
-            nn.Linear(512 * 8 * 8, 512)
+            nn.AdaptiveAvgPool2d(8), nn.Flatten(),
+            nn.Linear(512*8*8, 512)
         )
-
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
 
 class MorphogeneticDecoder(nn.Module):
-    """
-    Claim 12 — Morphogenetic Field Reconstruction
-    Regional decoders broadcast consistency signals
-    to neighboring regions before finalizing output.
-    Input dims: g=32, r=256, d=512 → combined=800
-    """
     def __init__(self):
         super().__init__()
         self.combine = nn.Sequential(
-            nn.Linear(800, 512 * 8 * 8), nn.ReLU()     # FIX: matched to 8x8 pool above
+            nn.Linear(800, 512*8*8), nn.ReLU()
         )
-        self.field_generator = nn.Linear(512 * 8 * 8, 64)
-        self.field_receiver  = nn.Linear(64, 512 * 8 * 8)
+        self.field_generator = nn.Linear(512*8*8, 64)
+        self.field_receiver = nn.Linear(64, 512*8*8)
         self.decode = nn.Sequential(
-            nn.Unflatten(1, (512, 8, 8)),               # FIX: matched to 8x8
+            nn.Unflatten(1, (512, 8, 8)),
             nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1), nn.ReLU(),
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.ReLU(),
             nn.ConvTranspose2d(128, 64,  4, stride=2, padding=1), nn.ReLU(),
-            nn.ConvTranspose2d(64,  32,  4, stride=2, padding=1), nn.ReLU(),  # FIX: extra upsample to reach 256
+            nn.ConvTranspose2d(64,  32,  4, stride=2, padding=1), nn.ReLU(),
             nn.ConvTranspose2d(32,  3,   4, stride=2, padding=1),
             nn.Sigmoid()
         )
-        # Output: 8 → 16 → 32 → 64 → 128 → 256  ✓
-
     def forward(self, g, r, d):
-        combined = torch.cat([g, r, d], dim=1)   # [B, 800]
-        x = self.combine(combined)               # [B, 512*8*8]
-        field_signal     = self.field_generator(x)
-        field_correction = self.field_receiver(field_signal)
-        x = x + 0.1 * field_correction           # morphogenetic modulation
-        return self.decode(x)                    # [B, 3, 256, 256]
+        x = self.combine(torch.cat([g, r, d], dim=1))
+        x = x + 0.1 * self.field_receiver(self.field_generator(x))
+        return self.decode(x)
 
 
-class HierarchicalFoundation(nn.Module):
-    """
-    Complete v5 foundation with all claims built in:
-    Claim 8  — 3D hierarchical encoders (global / regional / detail)
-    Claim 9  — Axon pathway classifier
-    Claim 12 — Morphogenetic field decoder
-    """
+class Foundation(nn.Module):
     def __init__(self):
         super().__init__()
-        self.global_encoder   = GlobalEncoder()
+        self.global_encoder = GlobalEncoder()
         self.regional_encoder = RegionalEncoder()
-        self.detail_encoder   = DetailEncoder()
-        self.decoder          = MorphogeneticDecoder()
-
-        # Claim 9 — Axon pathway classifier
+        self.detail_encoder = DetailEncoder()
+        self.decoder = MorphogeneticDecoder()
         self.pathway_classifier = nn.Sequential(
-            nn.Linear(800, 256), nn.ReLU(),
-            nn.Linear(256, 5)
+            nn.Linear(800, 256), nn.ReLU(), nn.Linear(256, 5)
         )
-
     def forward(self, x):
-        g = self.global_encoder(x)       # [B, 32]
-        r = self.regional_encoder(x)     # [B, 256]
-        d = self.detail_encoder(x)       # [B, 512]
-        reconstructed = self.decoder(g, r, d)   # [B, 3, 256, 256]
-        return reconstructed, g, r, d
+        g = self.global_encoder(x)
+        r = self.regional_encoder(x)
+        d = self.detail_encoder(x)
+        return self.decoder(g, r, d), g, r, d
 
 
-# ─────────────────────────────────────────────
-# Utility: atomic save (avoids Windows file-lock error code 32)
-# ─────────────────────────────────────────────
-def atomic_save(state_dict, path):
-    dir_name = os.path.dirname(os.path.abspath(path))
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-    os.close(tmp_fd)
-    try:
-        torch.save(state_dict, tmp_path)
-        if os.path.exists(path):
-            os.remove(path)
-        os.rename(tmp_path, path)
-    except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise e
+# ── DATA GENERATORS ──────────────────────────
 
-
-# ─────────────────────────────────────────────
-# Image helpers
-# ─────────────────────────────────────────────
-def prepare_image(path, size=IMAGE_SIZE):
-    img = Image.open(path).convert('RGB').resize((size, size))
-    return torch.FloatTensor(
-        np.array(img) / 255.0
-    ).permute(2, 0, 1).unsqueeze(0)
-
-
-def download_images():
-    print("Downloading diverse training images...")
+def download_images(target=1000):
+    """Download diverse images from Unsplash"""
     os.makedirs("training_images", exist_ok=True)
-
-    urls = [
-        ("https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=400", "mountain.jpg"),
-        ("https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400",    "portrait.jpg"),
-        ("https://images.unsplash.com/photo-1518791841217-8f162f1912da?w=400", "cat.jpg"),
-        ("https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?w=400", "city.jpg"),
-        ("https://images.unsplash.com/photo-1490730141103-6cac27aaab94?w=400", "sunset.jpg"),
-        ("https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=400", "forest.jpg"),
-        ("https://images.unsplash.com/photo-1551698618-1dfe5d97d256?w=400",    "snow.jpg"),
-        ("https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400", "face.jpg"),
+    categories = [
+        'nature','city','people','animals','food',
+        'architecture','technology','sports','travel',
+        'abstract','flowers','ocean','mountains','night',
+        'portrait','street','business','space','art'
     ]
+    count = len([f for f in os.listdir("training_images")
+                 if f.endswith('.jpg')])
+    if count >= target:
+        print(f"  Images: {count} already downloaded")
+        return
+    print(f"  Downloading images (target: {target})...")
+    per_cat = target // len(categories) + 1
+    for cat in categories:
+        for i in range(per_cat):
+            if count >= target:
+                break
+            try:
+                url = f"https://source.unsplash.com/256x256/?{cat}&sig={count}"
+                r = requests.get(url, timeout=8)
+                if r.status_code == 200:
+                    with open(f"training_images/{cat}_{i:04d}.jpg",'wb') as f:
+                        f.write(r.content)
+                    count += 1
+                    if count % 100 == 0:
+                        print(f"    {count}/{target} images")
+            except:
+                pass
+    print(f"  Images ready: {count}")
 
-    paths = []
-    for url, filename in urls:
-        path = f"training_images/{filename}"
-        if os.path.exists(path):
-            paths.append(path)
-            print(f"  Already exists: {filename}")
+
+def generate_video_frames(target=1000):
+    """Generate synthetic video frame sequences"""
+    folder = "training_data/video_frames"
+    os.makedirs(folder, exist_ok=True)
+    count = len([f for f in os.listdir(folder)
+                 if f.endswith('.jpg')])
+    if count >= target:
+        print(f"  Video frames: {count} already generated")
+        return
+    print(f"  Generating video frames (target: {target})...")
+    sequences = target // 20 + 1
+    count = 0
+    for seq in range(sequences):
+        if count >= target:
+            break
+        # Random motion parameters
+        r_speed = np.random.randint(1, 20)
+        g_speed = np.random.randint(1, 15)
+        hue = np.random.randint(0, 255)
+        for frame in range(20):
+            if count >= target:
+                break
+            img = np.zeros((256, 256, 3), dtype=np.uint8)
+            for y in range(256):
+                for x in range(256):
+                    img[y,x,0] = (x*r_speed + frame*10 + seq*30) % 256
+                    img[y,x,1] = (y*g_speed + frame*5) % 256
+                    img[y,x,2] = (hue + frame*12) % 256
+            Image.fromarray(img).save(
+                f"{folder}/seq{seq:04d}_f{frame:03d}.jpg"
+            )
+            count += 1
+    print(f"  Video frames ready: {count}")
+
+
+def generate_spectrograms(target=1000):
+    """Generate audio spectrogram images"""
+    folder = "training_data/spectrograms"
+    os.makedirs(folder, exist_ok=True)
+    count = len([f for f in os.listdir(folder)
+                 if f.endswith('.jpg')])
+    if count >= target:
+        print(f"  Spectrograms: {count} already generated")
+        return
+    print(f"  Generating spectrograms (target: {target})...")
+    for i in range(target):
+        # Multi-frequency signal simulation
+        freqs = np.random.uniform(0.5, 20, size=5)
+        amps = np.random.uniform(0.1, 1.0, size=5)
+        t = np.linspace(0, 1, 256*256)
+        signal = sum(a * np.sin(2*np.pi*f*t)
+                     for f, a in zip(freqs, amps))
+        signal += 0.1 * np.random.randn(len(signal))
+        signal = signal / (np.max(np.abs(signal)) + 1e-8)
+        # Convert to RGB spectrogram
+        data = signal.reshape(256, 256)
+        r = ((data + 1) / 2 * 255).astype(np.uint8)
+        g = (np.abs(data) * 255).astype(np.uint8)
+        b = ((1 - np.abs(data)) * 255).astype(np.uint8)
+        img = Image.fromarray(
+            np.stack([r, g, b], axis=2)
+        )
+        img.save(f"{folder}/spec_{i:04d}.jpg")
+        if (i+1) % 200 == 0:
+            print(f"    {i+1}/{target} spectrograms")
+    print(f"  Spectrograms ready: {target}")
+
+
+def generate_documents(target=1000):
+    """Generate synthetic document page images"""
+    folder = "training_data/documents"
+    os.makedirs(folder, exist_ok=True)
+    count = len([f for f in os.listdir(folder)
+                 if f.endswith('.jpg')])
+    if count >= target:
+        print(f"  Documents: {count} already generated")
+        return
+    print(f"  Generating document images (target: {target})...")
+    for i in range(target):
+        bg = np.random.randint(240, 256)
+        img = Image.new('RGB', (256,256),
+                        color=(bg, bg, bg))
+        draw = ImageDraw.Draw(img)
+        # Title
+        tw = np.random.randint(80, 220)
+        draw.rectangle([20, 15, tw, 28],
+                       fill=(np.random.randint(0,50),)*3)
+        # Text lines
+        for line in range(np.random.randint(8, 18)):
+            y = 40 + line * 14
+            lw = np.random.randint(40, 230)
+            gray = np.random.randint(30, 100)
+            draw.rectangle([20, y, lw, y+7],
+                           fill=(gray, gray, gray))
+        # Sometimes add a box (table/image)
+        if np.random.random() > 0.5:
+            x1 = np.random.randint(20, 100)
+            y1 = np.random.randint(100, 150)
+            x2 = x1 + np.random.randint(60, 140)
+            y2 = y1 + np.random.randint(40, 80)
+            gray = np.random.randint(150, 220)
+            draw.rectangle([x1,y1,x2,y2],
+                           fill=(gray,gray,gray))
+        img.save(f"{folder}/doc_{i:04d}.jpg")
+        if (i+1) % 200 == 0:
+            print(f"    {i+1}/{target} documents")
+    print(f"  Documents ready: {target}")
+
+
+# ── DATA LOADER ───────────────────────────────
+
+def load_all_training_data(max_per_type=250):
+    """Load images from all training folders"""
+    folders = [
+        ("training_images",             "Images"),
+        ("training_data/video_frames",  "Video"),
+        ("training_data/spectrograms",  "Audio"),
+        ("training_data/documents",     "Docs"),
+    ]
+    all_tensors = []
+    for folder, name in folders:
+        if not os.path.exists(folder):
             continue
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                with open(path, 'wb') as f:
-                    f.write(r.content)
-                paths.append(path)
-                print(f"  Downloaded: {filename}")
-            else:
-                print(f"  Failed (HTTP {r.status_code}): {filename}")
-        except Exception as e:
-            print(f"  Failed ({e}): {filename}")
+        count = 0
+        files = [f for f in sorted(os.listdir(folder))
+                 if f.lower().endswith(('.jpg','.jpeg','.png'))]
+        np.random.shuffle(files)
+        for fname in files[:max_per_type]:
+            try:
+                img = Image.open(
+                    os.path.join(folder, fname)
+                ).convert('RGB').resize((IMAGE_SIZE, IMAGE_SIZE))
+                t = torch.FloatTensor(
+                    np.array(img)/255.0
+                ).permute(2,0,1).unsqueeze(0)
+                all_tensors.append(t)
+                count += 1
+            except:
+                pass
+        print(f"  {name:8}: {count} samples loaded")
+    return all_tensors
 
-    if os.path.exists("demo.png"):
-        paths.append("demo.png")
-        print(f"  Added: demo.png")
 
-    return paths
+# ── TRAINING LOOP ─────────────────────────────
 
-
-# ─────────────────────────────────────────────
-# Training loop
-# ─────────────────────────────────────────────
-def train(epochs=2000):
-    print("\n" + "=" * 55)
-    print("UNIVERSAL FOUNDATION TRAINER v5")
-    print("3D Hierarchical + Morphogenetic Architecture")
-    print("Claims 8, 9, 12 built into foundation")
+def train(epochs=500, batch_size=16):
+    print("\n" + "="*55)
+    print("UNIVERSAL FOUNDATION TRAINER v5.2")
+    print("Training on: Images + Video + Audio + Documents")
     print(f"Device: {DEVICE}")
     print("Inventor: Rohit Kalu Sasane, Pune India 2026")
-    print("=" * 55 + "\n")
+    print("="*55)
 
-    image_paths = download_images()
-    print(f"\nTotal training images: {len(image_paths)}")
+    # Generate all training data
+    print("\nPreparing training data...")
+    download_images(target=1000)
+    generate_video_frames(target=1000)
+    generate_spectrograms(target=1000)
+    generate_documents(target=1000)
 
-    tensors = []
-    print("\nLoading images...")
-    for path in image_paths:
-        try:
-            t = prepare_image(path)
-            tensors.append(t)
-            print(f"  Loaded: {path}")
-        except Exception as e:
-            print(f"  Failed ({e}): {path}")
+    # Load data
+    print("\nLoading training data...")
+    tensors = load_all_training_data(max_per_type=250)
+    total = len(tensors)
+    print(f"\nTotal training samples: {total}")
 
-    if not tensors:
-        print("No images loaded. Check training_images folder.")
+    if total == 0:
+        print("No training data found.")
         return
 
-    batch = torch.cat(tensors, dim=0).to(DEVICE)
-    print(f"\nTraining batch: {batch.shape}")
-    print(f"Training for {epochs} epochs...\n")
+    # Initialize foundation
+    foundation = Foundation().to(DEVICE)
 
-    foundation = HierarchicalFoundation().to(DEVICE)
-    optimizer  = torch.optim.Adam(foundation.parameters(), lr=0.001)
-    scheduler  = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.5)
-    loss_fn    = nn.MSELoss()
-    best_loss  = float('inf')
+    # Load existing weights if available
+    if os.path.exists(SAVE_PATH):
+        try:
+            foundation.load_state_dict(
+                torch.load(SAVE_PATH, map_location=DEVICE,
+                          weights_only=True)
+            )
+            print("Loaded existing weights — continuing training")
+        except:
+            print("Starting fresh training")
+
+    optimizer = torch.optim.Adam(
+        foundation.parameters(), lr=0.001
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=200, gamma=0.5
+    )
+    loss_fn = nn.MSELoss()
+    best_loss = float('inf')
+
+    print(f"\nTraining {total} samples")
+    print(f"Epochs: {epochs}  Batch: {batch_size}")
+    print(f"Expected time on GPU: 30-60 minutes")
+    print(f"Expected time on CPU: several hours\n")
 
     for epoch in range(epochs):
-        optimizer.zero_grad()
-        reconstructed, g, r, d = foundation(batch)
-        loss = loss_fn(reconstructed, batch)
-        loss.backward()
-        optimizer.step()
+        epoch_loss = 0.0
+        np.random.shuffle(tensors)
+        batches = 0
+
+        for i in range(0, total, batch_size):
+            batch_list = tensors[i:i+batch_size]
+            if not batch_list:
+                continue
+            batch = torch.cat(batch_list).to(DEVICE)
+            optimizer.zero_grad()
+            out, g, r, d = foundation(batch)
+            loss = loss_fn(out, batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            batches += 1
+
         scheduler.step()
+        avg = epoch_loss / max(batches, 1)
 
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            atomic_save(foundation.state_dict(), SAVE_PATH)  # FIX: atomic, no file-lock error
+        if avg < best_loss:
+            best_loss = avg
+            # Atomic save
+            tmp = SAVE_PATH + ".tmp"
+            torch.save(foundation.state_dict(), tmp)
+            if os.path.exists(SAVE_PATH):
+                os.remove(SAVE_PATH)
+            os.rename(tmp, SAVE_PATH)
 
-        if (epoch + 1) % 200 == 0:
-            lr_now = scheduler.get_last_lr()[0]
-            print(f"Epoch {epoch+1:>4}/{epochs} — Loss: {loss.item():.6f}  "
-                  f"Best: {best_loss:.6f}  LR: {lr_now:.6f}")
+        if (epoch+1) % 50 == 0:
+            lr = scheduler.get_last_lr()[0]
+            print(f"Epoch {epoch+1:>4}/{epochs} — "
+                  f"Loss: {avg:.6f}  "
+                  f"Best: {best_loss:.6f}  "
+                  f"LR: {lr:.6f}")
 
-    size = os.path.getsize(SAVE_PATH)
-    print(f"\n{'=' * 55}")
+    sz = os.path.getsize(SAVE_PATH)
+    print(f"\n{'='*55}")
     print(f"Training complete!")
-    print(f"Best loss   : {best_loss:.6f}")
-    print(f"Saved to    : {SAVE_PATH}  ({size / 1024 / 1024:.1f} MB)")
-    print(f"Trained on  : {len(tensors)} diverse images")
-    print(f"Architecture: 3D hierarchical + morphogenetic")
-    print(f"\nNow run: python foundation_v5.py")
-    print("=" * 55)
+    print(f"Best loss:    {best_loss:.6f}")
+    print(f"Saved:        {SAVE_PATH} ({sz/1024/1024:.1f}MB)")
+    print(f"Trained on:   {total} samples")
+    print(f"File types:   Images + Video + Audio + Documents")
+    print(f"Now run:      python foundation_v4.py")
+    print(f"{'='*55}")
 
 
 if __name__ == "__main__":
     if os.path.exists(SAVE_PATH):
-        print(f"Foundation weights already exist: {SAVE_PATH}")
-        print("Delete that file to retrain from scratch.")
-        print("Downloading/checking images only...\n")
-        download_images()
-        print("Done.")
+        print(f"Weights exist: {SAVE_PATH}")
+        print("Delete to retrain from scratch.")
+        print("Continuing with data generation only...\n")
+        print("Preparing training data...")
+        download_images(target=1000)
+        generate_video_frames(target=1000)
+        generate_spectrograms(target=1000)
+        generate_documents(target=1000)
+        print("\nAll data ready. Delete weights to retrain.")
     else:
-        train(epochs=2000)
+        train(epochs=500, batch_size=16)
