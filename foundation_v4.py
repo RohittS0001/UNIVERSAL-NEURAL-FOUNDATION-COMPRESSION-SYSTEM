@@ -233,9 +233,8 @@ def find_parent(g, r, d, folder=".", threshold=0.85):
         if not fname.endswith('.dna'):
             continue
         try:
-            pg, pr, pd = load_dna(
-                os.path.join(folder, fname)
-            )[:3]
+            result = load_dna(os.path.join(folder, fname))
+            pg, pr, pd = result[0], result[1], result[2]
             v2 = torch.cat([
                 pg.flatten(), pr.flatten(), pd.flatten()
             ])
