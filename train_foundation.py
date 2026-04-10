@@ -3,26 +3,31 @@ import torch.nn as nn
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 import os
+import sys
 import tempfile
-import requests
 
 # ============================================
-# UNIVERSAL FOUNDATION TRAINER v5.3
-# 50 DIVERSE CATEGORIES PER FILE TYPE
-# Maximum quality — high resolution patterns
-# Images:     50 categories × real photos
-# Video:      50 motion pattern types
-# Audio:      50 frequency pattern types
-# Documents:  50 layout types
+# UNIVERSAL FOUNDATION TRAINER v5.6
+# CURRICULUM LEARNING — ONE TYPE AT A TIME
+# Phase 1: Images   — master visual patterns
+# Phase 2: Video    — add motion knowledge
+# Phase 3: Audio    — add frequency knowledge
+# Phase 4: Documents — add layout knowledge
+# Auto-resume from exact checkpoint
+# Never loses progress on restart
 # Inventor: Rohit Kalu Sasane, Pune India 2026
 # ============================================
 
-SAVE_PATH  = "foundation_v4_weights.pth"
-IMAGE_SIZE = 256
-DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SAVE_PATH       = "foundation_v4_weights.pth"
+CHECKPOINT_PATH = "foundation_v4_weights.pth.checkpoint"
+IMAGE_SIZE      = 256
+DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Training phases in order
+PHASES = ["images", "video", "audio", "documents"]
 
 
-# ── ARCHITECTURE — must match foundation_v4.py ──
+# ── ARCHITECTURE ─────────────────────────────
 
 class GlobalEncoder(nn.Module):
     def __init__(self):
@@ -124,104 +129,112 @@ def atomic_save(state_dict, path):
         raise e
 
 
-# ── 50 IMAGE CATEGORIES ──────────────────────
+# ── HIGH QUALITY IMAGES ───────────────────────
 
-IMAGE_CATEGORIES = [
-    # Nature
-    'mountain', 'ocean', 'forest', 'desert', 'waterfall',
-    'lake', 'river', 'sky', 'clouds', 'sunset',
-    # Urban
-    'city', 'street', 'architecture', 'bridge', 'skyscraper',
-    'night city', 'market', 'subway', 'airport', 'stadium',
-    # People
-    'portrait', 'crowd', 'children', 'elderly', 'wedding',
-    'sports', 'dance', 'fashion', 'work', 'celebration',
-    # Animals
-    'dog', 'cat', 'bird', 'lion', 'elephant',
-    'fish', 'butterfly', 'horse', 'wolf', 'eagle',
-    # Objects and textures
-    'food', 'flowers', 'cars', 'technology', 'art',
-    'abstract', 'texture', 'space', 'underwater', 'fire'
-]
-
-
-def download_images_diverse(target_per_category=20):
-    """Download real photos — 50 categories × 20 photos = 1000 images"""
+def download_images(target=1000):
+    """
+    STL10 — 96x96 real high quality photos
+    10 categories: airplane car bird cat deer
+                   dog horse monkey ship truck
+    Upscaled to 256x256 with LANCZOS — excellent quality
+    Download size: ~2.5GB but worth it
+    """
     os.makedirs("training_images", exist_ok=True)
     existing = len([f for f in os.listdir("training_images")
                     if f.endswith('.jpg')])
-    total_target = len(IMAGE_CATEGORIES) * target_per_category
 
-    if existing >= total_target:
+    if existing >= target:
         print(f"  Images: {existing} already ready")
         return
 
-    print(f"  Downloading {total_target} diverse images "
-          f"({len(IMAGE_CATEGORIES)} categories × {target_per_category})...")
+    print(f"  Downloading high quality images (target: {target})...")
+    print(f"  Using STL10 — 96x96 real photos")
 
-    count = existing
-    for cat_idx, category in enumerate(IMAGE_CATEGORIES):
-        cat_count = 0
-        for i in range(target_per_category):
-            if cat_count >= target_per_category:
+    try:
+        import torchvision.datasets as datasets
+        import torchvision.transforms as transforms
+
+        transform = transforms.Compose([
+            transforms.Resize((256, 256), Image.LANCZOS),
+        ])
+
+        count = existing
+
+        ds_train = datasets.STL10(
+            root='./stl10', split='train', download=True
+        )
+        ds_unlabeled = datasets.STL10(
+            root='./stl10', split='unlabeled', download=True
+        )
+
+        print(f"  STL10 train:     {len(ds_train)} images")
+        print(f"  STL10 unlabeled: {len(ds_unlabeled)} images")
+
+        for ds_name, ds in [
+            ("Train",     ds_train),
+            ("Unlabeled", ds_unlabeled)
+        ]:
+            if count >= target:
                 break
-            try:
-                # High quality Unsplash images
-                url = (f"https://source.unsplash.com/"
-                       f"512x512/?{category}&sig={count}")
-                r = requests.get(url, timeout=10)
-                if r.status_code == 200 and len(r.content) > 5000:
-                    path = (f"training_images/"
-                            f"{category.replace(' ','_')}_{i:03d}.jpg")
-                    with open(path, 'wb') as f:
-                        f.write(r.content)
-                    # Enhance quality
-                    img = Image.open(path).convert('RGB')
-                    img = img.resize((256, 256), Image.LANCZOS)
-                    enhancer = ImageEnhance.Sharpness(img)
-                    img = enhancer.enhance(1.2)
-                    enhancer = ImageEnhance.Contrast(img)
-                    img = enhancer.enhance(1.1)
-                    img.save(path, quality=95)
+            for i in range(len(ds)):
+                if count >= target:
+                    break
+                try:
+                    img = ds[i][0]
+                    if not isinstance(img, Image.Image):
+                        img = Image.fromarray(img)
+                    img = img.convert('RGB')
+                    img = img.resize((256,256), Image.LANCZOS)
+                    img = ImageEnhance.Sharpness(img).enhance(1.3)
+                    img = ImageEnhance.Contrast(img).enhance(1.1)
+                    img = ImageEnhance.Color(img).enhance(1.1)
+                    img.save(
+                        f"training_images/stl_{count:05d}.jpg",
+                        quality=97
+                    )
                     count += 1
-                    cat_count += 1
-            except:
-                pass
+                    if count % 200 == 0:
+                        print(f"    {count}/{target} images")
+                except:
+                    pass
+            print(f"  {ds_name}: done")
 
-        if (cat_idx + 1) % 10 == 0:
-            print(f"    {cat_idx+1}/{len(IMAGE_CATEGORIES)} "
-                  f"categories done — {count} images")
+        print(f"  Images ready: {count}")
 
-    # Fill remaining with CIFAR if Unsplash failed
-    if count < total_target // 2:
-        print(f"  Unsplash limited. Using CIFAR backup...")
+    except Exception as e:
+        print(f"  STL10 failed: {e}")
+        print(f"  Trying CIFAR100 as backup...")
         try:
             import torchvision.datasets as datasets
-            for ds_class, root in [
-                (datasets.CIFAR10,  './cifar10'),
-                (datasets.CIFAR100, './cifar100')
-            ]:
-                if count >= total_target:
+            count = existing
+            ds = datasets.CIFAR100(
+                root='./cifar100', download=True, train=True
+            )
+            for i in range(len(ds)):
+                if count >= target:
                     break
-                ds = ds_class(root=root, download=True, train=True)
-                for i in range(len(ds)):
-                    if count >= total_target:
-                        break
-                    img, _ = ds[i]
-                    img = img.resize((256,256), Image.LANCZOS)
-                    img.save(f"training_images/cifar_{count:05d}.jpg",
-                             quality=95)
-                    count += 1
-        except Exception as e:
-            print(f"  CIFAR failed: {e}")
+                img, _ = ds[i]
+                img = img.resize((256,256), Image.LANCZOS)
+                img = ImageEnhance.Sharpness(img).enhance(1.5)
+                img.save(
+                    f"training_images/img_{count:05d}.jpg",
+                    quality=95
+                )
+                count += 1
+                if count % 200 == 0:
+                    print(f"    {count}/{target} images")
+            print(f"  Images ready: {count}")
+        except Exception as e2:
+            print(f"  Backup failed: {e2}")
 
-    print(f"  Images ready: {count}")
 
-
-# ── 50 VIDEO PATTERN TYPES ───────────────────
+# ── HIGH QUALITY VIDEO FRAMES ─────────────────
 
 def generate_video_frames(target=1000):
-    """50 diverse motion pattern types — high quality"""
+    """
+    50 cinematic motion pattern types
+    High quality with smooth interpolation
+    """
     folder = "training_data/video_frames"
     os.makedirs(folder, exist_ok=True)
     existing = len([f for f in os.listdir(folder)
@@ -230,32 +243,35 @@ def generate_video_frames(target=1000):
         print(f"  Video frames: {existing} already ready")
         return
 
-    print(f"  Generating {target} high quality video frames "
-          f"(50 pattern types)...")
+    print(f"  Generating {target} cinematic video frames...")
 
-    # 50 distinct motion patterns
     patterns = [
-        'gradient_h', 'gradient_v', 'gradient_d', 'gradient_r',
-        'wave_sine', 'wave_cosine', 'wave_complex', 'wave_standing',
-        'radial_expand', 'radial_contract', 'radial_rotate', 'radial_pulse',
-        'checkerboard', 'checkerboard_color', 'checkerboard_fade',
-        'spiral_cw', 'spiral_ccw', 'spiral_zoom',
-        'noise_smooth', 'noise_sharp', 'noise_color',
-        'stripes_h', 'stripes_v', 'stripes_d', 'stripes_moving',
-        'zoom_in', 'zoom_out', 'zoom_rotate',
-        'pan_left', 'pan_right', 'pan_up', 'pan_down',
-        'flash', 'fade_in', 'fade_out',
-        'plasma', 'fire_sim', 'water_sim',
-        'tunnel', 'vortex', 'kaleidoscope',
-        'rgb_shift', 'hue_rotate', 'saturation_pulse',
-        'blur_motion', 'sharpen_motion',
-        'grid_move', 'dots_move', 'lines_move', 'circles_move'
+        'sunset_gradient', 'ocean_wave', 'forest_light',
+        'city_night', 'aurora', 'fire_glow',
+        'water_ripple', 'starfield', 'nebula',
+        'lava_flow', 'ice_crystal', 'sand_dune',
+        'rain_drop', 'snow_fall', 'cloud_move',
+        'lens_flare', 'bokeh', 'depth_field',
+        'motion_blur', 'zoom_burst',
+        'color_grade_warm', 'color_grade_cool',
+        'color_grade_teal', 'color_grade_vintage',
+        'film_grain', 'vignette', 'chromatic',
+        'double_exposure', 'light_leak', 'prism',
+        'kaleidoscope', 'mandala', 'fractal',
+        'topology', 'wireframe', 'hologram',
+        'scan_line', 'glitch', 'pixel_sort',
+        'wave_interference', 'standing_wave',
+        'spiral_galaxy', 'black_hole', 'corona',
+        'bioluminescence', 'crystal_growth',
+        'oil_slick', 'soap_bubble', 'prism_split',
+        'thermal_cam', 'sonar_ping'
     ]
 
-    count     = existing
+    count = existing
     frames_per_pattern = max(1, target // len(patterns))
     x_grid, y_grid = np.meshgrid(
-        np.arange(256), np.arange(256)
+        np.linspace(0, 1, 256),
+        np.linspace(0, 1, 256)
     )
 
     for pat_idx, pattern in enumerate(patterns):
@@ -264,115 +280,115 @@ def generate_video_frames(target=1000):
         for frame in range(frames_per_pattern):
             if count >= target:
                 break
-            t  = frame / frames_per_pattern
+
+            t  = frame / max(frames_per_pattern, 1)
             pi = np.pi
-            img = np.zeros((256,256,3), dtype=np.uint8)
             x, y = x_grid, y_grid
+            img = np.zeros((256, 256, 3), dtype=np.float32)
 
-            if pattern == 'gradient_h':
-                img[:,:,0] = (x + frame*5) % 256
-                img[:,:,1] = (255 - x + frame*3) % 256
-                img[:,:,2] = 128
+            if pattern == 'sunset_gradient':
+                img[:,:,0] = 0.9 - y*0.3 + t*0.1
+                img[:,:,1] = 0.4 + y*0.2 - t*0.1
+                img[:,:,2] = 0.1 + (1-y)*0.4 + t*0.2
 
-            elif pattern == 'gradient_v':
-                img[:,:,0] = (y + frame*5) % 256
-                img[:,:,1] = 128
-                img[:,:,2] = (255 - y + frame*3) % 256
+            elif pattern == 'ocean_wave':
+                wave = np.sin(x*8*pi + t*2*pi) * 0.1
+                depth = y + wave
+                img[:,:,0] = np.clip(0.1 - depth*0.1, 0, 1)
+                img[:,:,1] = np.clip(0.3 + depth*0.3, 0, 1)
+                img[:,:,2] = np.clip(0.6 + depth*0.4, 0, 1)
 
-            elif pattern == 'gradient_d':
-                img[:,:,0] = ((x+y) // 2 + frame*4) % 256
-                img[:,:,1] = ((x-y+256) // 2) % 256
-                img[:,:,2] = (frame * 8) % 256
+            elif pattern == 'aurora':
+                r = np.sin(x*3*pi + t*pi) * np.exp(-y*3)
+                g = np.sin(x*5*pi + t*2*pi) * np.exp(-y*2)
+                b = np.cos(x*4*pi + t*pi) * np.exp(-y*2.5)
+                img[:,:,0] = np.clip(r*0.5+0.1, 0, 1)
+                img[:,:,1] = np.clip(g*0.8+0.2, 0, 1)
+                img[:,:,2] = np.clip(b*0.7+0.3, 0, 1)
 
-            elif pattern == 'wave_sine':
-                v = ((np.sin(x/20 + t*2*pi) + 1) * 127).astype(np.uint8)
-                img[:,:,0] = v
-                img[:,:,1] = (v + 85) % 256
-                img[:,:,2] = (v + 170) % 256
+            elif pattern == 'nebula':
+                r = np.sin(x*pi*3 + y*pi*2 + t*pi)
+                g = np.cos(x*pi*4 + t*pi*2)
+                b = np.sin(y*pi*5 + t*pi*3)
+                noise = np.random.rand(256,256) * 0.05
+                img[:,:,0] = np.clip(r*0.5+0.4+noise, 0, 1)
+                img[:,:,1] = np.clip(g*0.3+0.2+noise, 0, 1)
+                img[:,:,2] = np.clip(b*0.6+0.5+noise, 0, 1)
 
-            elif pattern == 'wave_cosine':
-                v = ((np.cos(y/20 + t*2*pi) + 1) * 127).astype(np.uint8)
-                img[:,:,0] = v
-                img[:,:,1] = (255 - v)
-                img[:,:,2] = 128
+            elif pattern == 'fire_glow':
+                heat = np.sin(x*pi*4 + t*3*pi) * np.exp(-(1-y)*3)
+                img[:,:,0] = np.clip(heat*0.8+0.6, 0, 1)
+                img[:,:,1] = np.clip(heat*0.4+0.1, 0, 1)
+                img[:,:,2] = np.clip(heat*0.1, 0, 1)
 
-            elif pattern == 'wave_complex':
-                v = ((np.sin(x/15 + t*2*pi) *
-                      np.cos(y/15 + t*pi) + 1) * 127).astype(np.uint8)
-                img[:,:,0] = v
-                img[:,:,1] = (v * 2) % 256
-                img[:,:,2] = 255 - v
+            elif pattern == 'starfield':
+                np.random.seed(pat_idx*100 + frame)
+                stars = np.random.rand(256,256)
+                bright = (stars > 0.98).astype(np.float32)
+                twinkle = bright * (0.8 + 0.2*np.sin(t*10*pi))
+                img[:,:,0] = twinkle
+                img[:,:,1] = twinkle
+                img[:,:,2] = np.clip(twinkle + bright*0.2, 0, 1)
 
-            elif pattern == 'radial_expand':
-                cx = 128 + int(30 * np.sin(t*2*pi))
-                cy = 128 + int(30 * np.cos(t*2*pi))
-                dist = np.sqrt((x-cx)**2 + (y-cy)**2)
-                v = (dist * 2 + frame*10) % 256
-                img[:,:,0] = v.astype(np.uint8)
-                img[:,:,1] = (255 - v).astype(np.uint8)
-                img[:,:,2] = 128
+            elif pattern == 'kaleidoscope':
+                cx = x - 0.5
+                cy = y - 0.5
+                r  = np.sqrt(cx**2 + cy**2)
+                a  = np.arctan2(cy, cx) + t*pi
+                a  = np.abs(((a % (pi/3)) - pi/6))
+                img[:,:,0] = np.clip(np.sin(r*8*pi + a*6)*0.5+0.5, 0, 1)
+                img[:,:,1] = np.clip(np.cos(r*6*pi + t*2*pi)*0.5+0.5, 0, 1)
+                img[:,:,2] = np.clip(np.sin(a*8 + t*pi)*0.5+0.5, 0, 1)
 
-            elif pattern == 'checkerboard':
-                c = ((x//16 + y//16 + frame) % 2) * 200
-                img[:,:,0] = c
-                img[:,:,1] = c
-                img[:,:,2] = c
+            elif pattern == 'oil_slick':
+                r = np.sqrt((x-0.5)**2 + (y-0.5)**2)
+                h = (r*8 + t*2) % 1.0
+                s = np.ones_like(h) * 0.9
+                v = np.ones_like(h) * 0.8
+                # HSV to RGB — full conversion kept
+                hi = (h*6).astype(int) % 6
+                f  = h*6 - hi.astype(float)
+                p  = v*(1-s)
+                q  = v*(1-s*f)
+                tk = v*(1-s*(1-f))
+                for c_idx, (rc,gc,bc) in enumerate([
+                    (v,tk,p),(q,v,p),(p,v,tk),
+                    (p,q,v),(tk,p,v),(v,p,q)
+                ]):
+                    mask = (hi == c_idx)
+                    img[:,:,0] += rc * mask
+                    img[:,:,1] += gc * mask
+                    img[:,:,2] += bc * mask
 
-            elif pattern == 'checkerboard_color':
-                c = (x//16 + y//16 + frame) % 2
-                img[:,:,0] = c * 220
-                img[:,:,1] = (1-c) * 180
-                img[:,:,2] = ((x//16 + frame) % 3) * 100
+            elif pattern == 'glitch':
+                base = x.copy()
+                for line in range(0, 256, np.random.randint(8,32)):
+                    shift = int(np.random.randint(-20,20) * t)
+                    if 0 <= line < 256:
+                        img[line,:,0] = np.roll(base[line], shift)
+                        img[line,:,1] = np.roll(base[line], shift//2)
+                        img[line,:,2] = np.roll(base[line], -shift//2)
 
-            elif pattern == 'plasma':
-                v = (np.sin(x/20) + np.sin(y/20) +
-                     np.sin((x+y)/20 + t*4) +
-                     np.sin(np.sqrt(x**2+y**2)/20))
-                v = ((v + 4) / 8 * 255).astype(np.uint8)
-                img[:,:,0] = v
-                img[:,:,1] = (v + 85) % 256
-                img[:,:,2] = (v + 170) % 256
-
-            elif pattern == 'spiral_cw':
-                angle = np.arctan2(y-128, x-128) + t*2*pi
-                dist  = np.sqrt((x-128)**2 + (y-128)**2)
-                v = (angle * 40 + dist * 2) % 256
-                img[:,:,0] = v.astype(np.uint8)
-                img[:,:,1] = (255-v).astype(np.uint8)
-                img[:,:,2] = dist.astype(np.uint8) % 256
-
-            elif pattern == 'noise_smooth':
-                base = np.random.rand(32,32) * 255
-                from PIL import Image as PILImage
-                noise_img = PILImage.fromarray(
-                    base.astype(np.uint8)
-                ).resize((256,256), PILImage.BILINEAR)
-                noise = np.array(noise_img)
-                img[:,:,0] = noise
-                img[:,:,1] = (noise + frame*5) % 256
-                img[:,:,2] = (255 - noise)
-
-            elif pattern == 'hue_rotate':
-                h = (x/256 + t) % 1.0
-                s = np.ones_like(h) * 0.8
-                v = np.ones_like(h) * 0.9
-                from colorsys import hsv_to_rgb
-                for yi in range(0, 256, 4):
-                    for xi in range(0, 256, 4):
-                        r,g,b = hsv_to_rgb(h[yi,xi], s[yi,xi], v[yi,xi])
-                        img[yi:yi+4, xi:xi+4, 0] = int(r*255)
-                        img[yi:yi+4, xi:xi+4, 1] = int(g*255)
-                        img[yi:yi+4, xi:xi+4, 2] = int(b*255)
+            elif pattern == 'thermal_cam':
+                heat = np.sin(x*pi*3)*np.cos(y*pi*2) + t*0.5
+                heat = (heat - heat.min()) / (heat.max()-heat.min()+1e-8)
+                img[:,:,0] = np.clip(heat*2, 0, 1)
+                img[:,:,1] = np.clip(1-np.abs(heat-0.5)*2, 0, 1)
+                img[:,:,2] = np.clip((1-heat)*2, 0, 1)
 
             else:
-                # Default — colored gradient with motion
-                img[:,:,0] = (x + frame*7 + pat_idx*5) % 256
-                img[:,:,1] = (y + frame*5 + pat_idx*3) % 256
-                img[:,:,2] = (frame*10 + pat_idx*7) % 256
+                # Rich colorful default
+                r = np.sin(x*pi*(pat_idx%5+2) + t*2*pi)*0.5+0.5
+                g = np.cos(y*pi*(pat_idx%4+3) + t*pi)*0.5+0.5
+                b = np.sin((x+y)*pi*(pat_idx%3+2) + t*3*pi)*0.5+0.5
+                img[:,:,0] = r
+                img[:,:,1] = g
+                img[:,:,2] = b
 
-            # High quality save
-            pil_img = Image.fromarray(img)
+            img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_uint8)
             pil_img = pil_img.filter(ImageFilter.SMOOTH)
+            pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.2)
             pil_img.save(
                 f"{folder}/pat{pat_idx:02d}_f{frame:03d}.jpg",
                 quality=95
@@ -382,10 +398,13 @@ def generate_video_frames(target=1000):
     print(f"  Video frames ready: {count}")
 
 
-# ── 50 AUDIO PATTERN TYPES ───────────────────
+# ── HIGH QUALITY AUDIO SPECTROGRAMS ──────────
 
 def generate_spectrograms(target=1000):
-    """50 diverse audio frequency patterns — high quality"""
+    """
+    50 diverse rich audio patterns
+    RGB spectrograms with high color depth
+    """
     folder = "training_data/spectrograms"
     os.makedirs(folder, exist_ok=True)
     existing = len([f for f in os.listdir(folder)
@@ -394,34 +413,23 @@ def generate_spectrograms(target=1000):
         print(f"  Spectrograms: {existing} already ready")
         return
 
-    print(f"  Generating {target} high quality spectrograms "
-          f"(50 audio types)...")
+    print(f"  Generating {target} rich audio spectrograms...")
 
     audio_types = [
-        # Tonal patterns
-        'pure_tone', 'dual_tone', 'triple_tone', 'chord',
-        'octave', 'fifth', 'fourth', 'major_scale',
-        # Noise types
-        'white_noise', 'pink_noise', 'brown_noise',
-        'burst_noise', 'impulse', 'crackle',
-        # Music patterns
-        'bass', 'treble', 'mid_range', 'full_spectrum',
-        'percussion', 'strings', 'brass', 'voice',
-        # Sweep patterns
-        'chirp_up', 'chirp_down', 'chirp_fast', 'chirp_slow',
-        # Modulation
-        'am_slow', 'am_fast', 'fm_slow', 'fm_fast',
-        'ring_mod', 'tremolo', 'vibrato',
-        # Environmental
-        'rain', 'thunder', 'wind', 'ocean_waves',
-        'crowd', 'traffic', 'machinery',
-        # Complex
-        'harmonic_rich', 'harmonic_sparse', 'inharmonic',
-        'beating', 'resonance', 'echo_sim',
-        'speech_pattern', 'music_pattern'
+        'pure_tone','dual_tone','triple_tone','chord','arpeggio',
+        'octave','fifth','fourth','major_scale','minor_scale',
+        'white_noise','pink_noise','brown_noise','burst_noise','impulse',
+        'bass_heavy','treble_heavy','mid_range','full_spectrum','sub_bass',
+        'chirp_up','chirp_down','chirp_fast','chirp_slow','chirp_complex',
+        'am_slow','am_fast','fm_slow','fm_fast','pm_mod',
+        'ring_mod','tremolo','vibrato','chorus','flanger',
+        'rain','thunder','wind','ocean','crowd',
+        'harmonic_rich','harmonic_sparse','inharmonic','beating','resonance',
+        'speech_vowel','speech_consonant','whisper','shout','music_mix',
+        'echo_short','echo_long','reverb_room','reverb_hall','reverb_plate'
     ]
 
-    t = np.linspace(0, 4, 256*256)
+    t_arr = np.linspace(0, 4, 256*256)
     count = existing
 
     for type_idx, audio_type in enumerate(audio_types):
@@ -433,88 +441,85 @@ def generate_spectrograms(target=1000):
             if count >= target:
                 break
 
-            # Generate signal based on type
-            freq_base = np.random.uniform(1, 20)
+            fb = np.random.uniform(2, 30)
 
             if audio_type == 'pure_tone':
-                signal = np.sin(2*np.pi*freq_base*t)
-
+                s = np.sin(2*np.pi*fb*t_arr)
             elif audio_type == 'dual_tone':
-                f2 = freq_base * np.random.uniform(1.5, 3)
-                signal = (0.6*np.sin(2*np.pi*freq_base*t) +
-                         0.4*np.sin(2*np.pi*f2*t))
-
+                s = (0.6*np.sin(2*np.pi*fb*t_arr) +
+                     0.4*np.sin(2*np.pi*fb*1.5*t_arr))
             elif audio_type == 'chord':
-                ratios = [1, 5/4, 3/2, 2]
-                signal = sum(np.sin(2*np.pi*freq_base*r*t)/4
-                            for r in ratios)
-
+                ratios = [1, 5/4, 3/2, 2, 5/2]
+                s = sum(np.sin(2*np.pi*fb*r*t_arr)/5
+                       for r in ratios)
+            elif audio_type == 'arpeggio':
+                scale  = [1, 5/4, 3/2, 2]
+                chunks = np.array_split(t_arr, 4)
+                s = np.concatenate([
+                    np.sin(2*np.pi*fb*r*c)
+                    for r, c in zip(scale, chunks)
+                ])
             elif audio_type == 'major_scale':
-                scale = [1, 9/8, 5/4, 4/3, 3/2, 5/3, 15/8, 2]
-                idx   = variant % 8
-                signal = np.sin(2*np.pi*freq_base*scale[idx]*t)
-
+                notes  = [1,9/8,5/4,4/3,3/2,5/3,15/8,2]
+                chunks = np.array_split(t_arr, 8)
+                s = np.concatenate([
+                    np.sin(2*np.pi*fb*n*c)
+                    for n, c in zip(notes, chunks)
+                ])
             elif audio_type == 'white_noise':
-                signal = np.random.randn(len(t))
-
+                s = np.random.randn(len(t_arr))
             elif audio_type == 'pink_noise':
-                white  = np.random.randn(len(t))
-                signal = np.cumsum(white) / np.arange(1, len(t)+1)
-
+                w = np.random.randn(len(t_arr))
+                s = np.cumsum(w) / (np.arange(1,len(t_arr)+1)**0.5)
+            elif audio_type == 'brown_noise':
+                w = np.random.randn(len(t_arr))
+                s = np.cumsum(w)
             elif audio_type == 'chirp_up':
-                signal = np.sin(2*np.pi*(freq_base + 5*t)*t)
-
+                s = np.sin(2*np.pi*(fb + 20*t_arr)*t_arr)
             elif audio_type == 'chirp_down':
-                signal = np.sin(2*np.pi*(freq_base*3 - 5*t)*t)
-
+                s = np.sin(2*np.pi*(fb*5 - 20*t_arr)*t_arr)
             elif audio_type == 'am_slow':
-                carrier = np.sin(2*np.pi*freq_base*10*t)
-                mod     = (1 + 0.5*np.sin(2*np.pi*0.5*t))
-                signal  = carrier * mod
-
+                s = np.sin(2*np.pi*fb*10*t_arr) * (1+0.8*np.sin(2*np.pi*0.5*t_arr))
             elif audio_type == 'fm_fast':
-                signal = np.sin(2*np.pi*freq_base*t +
-                                5*np.sin(2*np.pi*3*t))
-
+                s = np.sin(2*np.pi*fb*t_arr + 8*np.sin(2*np.pi*5*t_arr))
             elif audio_type == 'harmonic_rich':
-                signal = sum(np.sin(2*np.pi*freq_base*k*t) / k
-                            for k in range(1, 12))
-
+                s = sum(np.sin(2*np.pi*fb*k*t_arr)/k for k in range(1,16))
             elif audio_type == 'beating':
-                f2     = freq_base + 0.5
-                signal = (np.sin(2*np.pi*freq_base*t) +
-                         np.sin(2*np.pi*f2*t))
-
-            elif audio_type == 'percussion':
-                env    = np.exp(-t * 10)
-                signal = np.random.randn(len(t)) * env
-
-            elif audio_type == 'speech_pattern':
-                formants = [freq_base, freq_base*3, freq_base*6]
-                signal   = sum(0.3*np.sin(2*np.pi*f*t)
-                              for f in formants)
-                signal  *= (1 + 0.3*np.sin(2*np.pi*3*t))
-
+                s = np.sin(2*np.pi*fb*t_arr)+np.sin(2*np.pi*(fb+0.3)*t_arr)
+            elif audio_type == 'speech_vowel':
+                f1,f2,f3 = fb,fb*3,fb*6
+                s = (np.sin(2*np.pi*f1*t_arr)*0.5 +
+                     np.sin(2*np.pi*f2*t_arr)*0.3 +
+                     np.sin(2*np.pi*f3*t_arr)*0.2)
+                s *= (1+0.4*np.sin(2*np.pi*4*t_arr))
+            elif audio_type == 'echo_short':
+                base  = np.sin(2*np.pi*fb*t_arr)
+                delay = np.roll(base, 1000)
+                s     = base + 0.5*delay + 0.25*np.roll(delay,1000)
+            elif audio_type == 'reverb_hall':
+                base = np.sin(2*np.pi*fb*t_arr)
+                s    = sum(0.8**i * np.roll(base, i*500)
+                          for i in range(8))
             else:
-                freqs  = np.random.uniform(0.5, 20, size=4)
-                amps   = np.random.uniform(0.1, 1.0, size=4)
-                signal = sum(a*np.sin(2*np.pi*f*t)
-                            for f,a in zip(freqs,amps))
+                freqs = np.random.uniform(1, 30, size=6)
+                amps  = np.random.uniform(0.1, 1.0, size=6)
+                s = sum(a*np.sin(2*np.pi*f*t_arr)
+                       for f,a in zip(freqs,amps))
 
-            # Add subtle noise
-            signal += 0.02 * np.random.randn(len(signal))
-            signal  = signal / (np.max(np.abs(signal)) + 1e-8)
-            data    = signal.reshape(256, 256)
+            s += 0.01*np.random.randn(len(s))
+            s  = s / (np.max(np.abs(s)) + 1e-8)
+            d  = s.reshape(256, 256)
 
-            # High quality RGB spectrogram
-            r_ch = ((data + 1) / 2 * 255).astype(np.uint8)
-            g_ch = (np.abs(data) * 255).astype(np.uint8)
-            b_ch = ((1 - np.abs(data)) * 200 +
-                    np.abs(np.roll(data,10,axis=1)) * 55
-                    ).astype(np.uint8)
+            r_ch = ((d+1)/2*255).astype(np.uint8)
+            g_ch = (np.abs(d)*255).astype(np.uint8)
+            b_ch = np.clip(
+                (1-np.abs(d))*180 + np.abs(np.roll(d,8,1))*75,
+                0, 255
+            ).astype(np.uint8)
 
             img = Image.fromarray(np.stack([r_ch,g_ch,b_ch], axis=2))
             img = img.filter(ImageFilter.SMOOTH_MORE)
+            img = ImageEnhance.Contrast(img).enhance(1.2)
             img.save(
                 f"{folder}/type{type_idx:02d}_v{variant:03d}.jpg",
                 quality=95
@@ -524,10 +529,13 @@ def generate_spectrograms(target=1000):
     print(f"  Spectrograms ready: {count}")
 
 
-# ── 50 DOCUMENT LAYOUT TYPES ─────────────────
+# ── HIGH QUALITY DOCUMENT LAYOUTS ────────────
 
 def generate_documents(target=1000):
-    """50 diverse professional document layouts — high quality"""
+    """
+    50 diverse professional document layouts
+    High quality with realistic proportions
+    """
     folder = "training_data/documents"
     os.makedirs(folder, exist_ok=True)
     existing = len([f for f in os.listdir(folder)
@@ -536,29 +544,19 @@ def generate_documents(target=1000):
         print(f"  Documents: {existing} already ready")
         return
 
-    print(f"  Generating {target} high quality documents "
-          f"(50 layout types)...")
+    print(f"  Generating {target} professional document layouts...")
 
     doc_types = [
-        # Text documents
-        'report', 'letter', 'memo', 'essay', 'article',
-        'resume', 'contract', 'manual', 'thesis', 'notes',
-        # Data documents
-        'spreadsheet', 'invoice', 'receipt', 'statement', 'budget',
-        'table_data', 'comparison', 'schedule', 'calendar', 'timeline',
-        # Visual documents
-        'presentation_slide', 'poster', 'flyer', 'brochure', 'certificate',
-        'infographic', 'diagram', 'flowchart', 'org_chart', 'mind_map',
-        # Scientific
-        'research_paper', 'lab_report', 'equation_sheet',
-        'graph_sheet', 'data_table',
-        # Business
-        'business_card', 'letterhead', 'form', 'questionnaire',
-        'feedback_form', 'application', 'proposal', 'pitch_deck',
-        # Mixed layouts
-        'newspaper', 'magazine', 'book_page', 'legal_doc',
-        'medical_record', 'blueprint', 'map_legend',
-        'music_sheet', 'code_listing', 'comic_layout'
+        'report','letter','memo','essay','article',
+        'resume','contract','manual','thesis','notes',
+        'spreadsheet','invoice','receipt','statement','budget',
+        'table_data','comparison','schedule','calendar','timeline',
+        'presentation','poster','flyer','brochure','certificate',
+        'infographic','diagram','flowchart','org_chart','mind_map',
+        'research_paper','lab_report','equation_sheet','graph_sheet','data_table',
+        'business_card','letterhead','form','questionnaire','feedback_form',
+        'newspaper','magazine','book_page','legal_doc','medical_record',
+        'blueprint','map_legend','music_sheet','code_listing','comic_layout'
     ]
 
     count = existing
@@ -572,278 +570,350 @@ def generate_documents(target=1000):
             if count >= target:
                 break
 
-            bg    = np.random.randint(245, 256)
-            img   = Image.new('RGB', (256,256), (bg,bg,bg))
-            draw  = ImageDraw.Draw(img)
+            bg     = np.random.randint(245, 256)
+            img    = Image.new('RGB', (256,256), (bg,bg,bg))
+            draw   = ImageDraw.Draw(img)
             accent = tuple(np.random.randint(20,180,3).tolist())
+            dark   = tuple(np.random.randint(20,60,3).tolist())
+            light  = tuple(np.random.randint(200,240,3).tolist())
 
-            if doc_type in ['report','essay','article','thesis']:
-                # Title bar
-                draw.rectangle([0,0,256,35], fill=accent)
-                draw.rectangle([10,8,200,27], fill=(255,255,255))
-                # Body text lines
-                for line in range(15):
-                    y  = 45 + line*13
-                    lw = np.random.randint(180,250)
-                    gv = np.random.randint(40,80)
-                    draw.rectangle([10,y,lw,y+7], fill=(gv,gv,gv))
-                # Page number
-                draw.rectangle([110,248,146,255], fill=(150,150,150))
-
-            elif doc_type in ['invoice','receipt','statement']:
-                # Header
-                draw.rectangle([0,0,256,40], fill=accent)
-                # Table header
-                draw.rectangle([5,45,251,60],
-                               fill=(200,200,200))
-                for row in range(7):
-                    y = 65 + row*25
-                    draw.rectangle([5,y,251,y+20],
-                                   outline=(180,180,180), width=1)
-                    for col in [5,80,150,200]:
-                        draw.rectangle([col,y,col+65,y+20],
-                                       outline=(200,200,200), width=1)
-                # Total bar
-                draw.rectangle([5,245,251,255],
-                               fill=accent)
-
-            elif doc_type in ['presentation_slide','poster','flyer']:
-                # Full color background
-                bg_color = tuple(
-                    np.random.randint(100,200,3).tolist()
-                )
-                img = Image.new('RGB', (256,256), bg_color)
-                draw = ImageDraw.Draw(img)
-                # Title block
-                draw.rectangle([10,15,246,60],
-                               fill=(255,255,255))
-                # Content blocks
-                for block in range(3):
-                    x = 10 + block*82
-                    draw.rectangle([x,70,x+75,180],
-                                   fill=(255,255,255))
-                # Footer
-                draw.rectangle([0,220,256,256],
-                               fill=(50,50,50))
-
-            elif doc_type in ['spreadsheet','table_data','budget']:
-                # Grid
-                for row in range(10):
-                    y = 20 + row*23
-                    draw.rectangle([0,y,256,y+1],
-                                   fill=(180,180,180))
-                for col in range(5):
-                    x = col*52
-                    draw.rectangle([x,0,x+1,256],
-                                   fill=(180,180,180))
-                # Header row
-                draw.rectangle([0,0,256,20], fill=accent)
-                # Data cells
-                for row in range(1,10):
-                    for col in range(5):
-                        if np.random.random() > 0.3:
-                            x = col*52+2
-                            y = 20+row*23+3
-                            w = np.random.randint(20,45)
-                            draw.rectangle([x,y,x+w,y+14],
-                                           fill=(100,100,100))
-
-            elif doc_type in ['graph_sheet','infographic']:
-                # Background
-                draw.rectangle([0,0,256,256], fill=(245,248,255))
-                # Axes
-                draw.line([(30,220),(230,220)], fill=(0,0,0), width=2)
-                draw.line([(30,20),(30,220)], fill=(0,0,0), width=2)
-                # Data points and bars
-                colors = [(200,50,50),(50,150,200),(50,200,100)]
-                for i in range(8):
-                    x = 50 + i*23
-                    h = np.random.randint(20,180)
-                    color = colors[i%3]
-                    draw.rectangle([x,220-h,x+18,220],
-                                   fill=color)
-
-            elif doc_type in ['flowchart','diagram','org_chart']:
-                # Boxes and arrows
-                draw.rectangle([85,10,171,40], fill=accent)
-                draw.line([(128,40),(128,60)], fill=(0,0,0), width=2)
-                for i,x in enumerate([30,85,140]):
-                    draw.rectangle([x,60,x+55,90],
-                                   fill=(200,220,240))
-                    draw.line([(x+27,90),(x+27,110)],
-                              fill=(0,0,0), width=1)
-                    draw.rectangle([x,110,x+55,140],
-                                   fill=(220,240,200))
-
-            elif doc_type in ['newspaper','magazine']:
-                # Masthead
-                draw.rectangle([0,0,256,30], fill=(20,20,20))
-                draw.rectangle([5,5,160,25], fill=(255,255,255))
-                # Columns
-                draw.rectangle([128,35,130,240],
-                               fill=(180,180,180))
-                for col in [0,1]:
-                    x_off = col * 133
-                    draw.rectangle([x_off+5,35,x_off+120,90],
-                                   fill=(200,200,200))
-                    for line in range(10):
-                        y = 95 + line*14
-                        w = np.random.randint(80,120)
-                        gv = np.random.randint(50,100)
-                        draw.rectangle(
-                            [x_off+5,y,x_off+w,y+8],
-                            fill=(gv,gv,gv)
-                        )
+            if doc_type in ['report','essay','article','thesis','manual']:
+                draw.rectangle([0,0,256,38], fill=accent)
+                draw.rectangle([10,8,220,30], fill=(255,255,255))
+                draw.rectangle([10,8,180,20], fill=light)
+                for line in range(14):
+                    y  = 48 + line*13
+                    lw = np.random.randint(160,248)
+                    gv = np.random.randint(50,90)
+                    h  = np.random.randint(5,9)
+                    draw.rectangle([10,y,lw,y+h], fill=(gv,gv,gv))
+                draw.rectangle([100,248,156,255], fill=(180,180,180))
 
             elif doc_type in ['resume','letter','contract']:
-                # Professional layout
-                draw.rectangle([0,0,256,50], fill=accent)
-                draw.rectangle([10,10,150,40],
-                               fill=(255,255,255))
-                draw.rectangle([0,55,5,256],
-                               fill=accent)
-                sections = ['EXPERIENCE','EDUCATION','SKILLS']
-                for s_idx, section in enumerate(sections):
-                    y = 65 + s_idx*60
-                    draw.rectangle([10,y,100,y+10],
-                                   fill=(80,80,80))
+                draw.rectangle([0,0,256,55], fill=accent)
+                draw.rectangle([10,10,160,45], fill=(255,255,255))
+                draw.rectangle([0,55,6,256], fill=accent)
+                for s_idx in range(3):
+                    y = 65 + s_idx*62
+                    draw.rectangle([12,y,110,y+11], fill=dark)
+                    draw.rectangle([12,y+15,246,y+16],
+                                   fill=(200,200,200))
                     for line in range(3):
+                        lw = np.random.randint(120,240)
                         draw.rectangle(
-                            [15, y+15+line*12,
-                             np.random.randint(150,240),
-                             y+22+line*12],
+                            [15, y+20+line*13,
+                             lw, y+28+line*13],
                             fill=(120,120,120)
                         )
 
+            elif doc_type in ['invoice','receipt','statement','budget']:
+                draw.rectangle([0,0,256,45], fill=accent)
+                draw.rectangle([10,8,180,37], fill=(255,255,255))
+                draw.rectangle([5,50,251,65], fill=dark)
+                for row in range(7):
+                    y = 70 + row*24
+                    fill_color = light if row%2==0 else (bg,bg,bg)
+                    draw.rectangle([5,y,251,y+22], fill=fill_color)
+                    for col in [5,75,140,195]:
+                        w = np.random.randint(25,55)
+                        draw.rectangle([col+3,y+5,col+w,y+16],
+                                       fill=(100,100,100))
+                draw.rectangle([5,240,251,255], fill=accent)
+
+            elif doc_type in ['spreadsheet','table_data','comparison']:
+                draw.rectangle([0,0,256,20], fill=accent)
+                for row in range(11):
+                    y = 20 + row*22
+                    c = light if row%2==0 else (bg,bg,bg)
+                    draw.rectangle([0,y,256,y+22], fill=c)
+                    draw.rectangle([0,y,256,y+1], fill=(180,180,180))
+                for col in range(5):
+                    x = col*52
+                    draw.rectangle([x,0,x+1,256], fill=(180,180,180))
+                    for row in range(1,11):
+                        y = 20+row*22
+                        w = np.random.randint(15,45)
+                        draw.rectangle([x+3,y+5,x+w,y+16],
+                                       fill=(80,80,80))
+
+            elif doc_type in ['graph_sheet','infographic','data_table']:
+                draw.rectangle([0,0,256,256], fill=(248,250,255))
+                draw.line([(25,225),(240,225)], fill=(0,0,0), width=2)
+                draw.line([(25,15),(25,225)], fill=(0,0,0), width=2)
+                colors = [
+                    (220,60,60),(60,160,220),(60,200,100),
+                    (220,160,60),(160,60,220)
+                ]
+                for i in range(8):
+                    x = 40 + i*25
+                    h = np.random.randint(30,190)
+                    draw.rectangle([x,225-h,x+18,225],
+                                   fill=colors[i%5])
+                for i in range(5):
+                    y = 225 - i*40
+                    draw.line([(22,y),(240,y)],
+                              fill=(200,200,200), width=1)
+
+            elif doc_type in ['flowchart','diagram','org_chart','mind_map']:
+                draw.rectangle([88,8,168,36], fill=accent)
+                draw.rectangle([90,10,166,34], fill=(255,255,255))
+                draw.line([(128,36),(128,55)], fill=dark, width=2)
+                positions = [(20,55),(88,55),(156,55)]
+                for px in positions:
+                    draw.rectangle(
+                        [px[0],px[1],px[0]+60,px[1]+28],
+                        fill=light, outline=dark, width=1
+                    )
+                    draw.line(
+                        [(px[0]+30,px[1]+28),(px[0]+30,px[1]+48)],
+                        fill=dark, width=1
+                    )
+                    draw.rectangle(
+                        [px[0],px[1]+48,px[0]+60,px[1]+76],
+                        fill=(220,240,200), outline=dark, width=1
+                    )
+
+            elif doc_type in ['newspaper','magazine']:
+                draw.rectangle([0,0,256,32], fill=(15,15,15))
+                draw.rectangle([8,6,170,26], fill=(255,255,255))
+                draw.rectangle([0,32,256,33], fill=(180,0,0))
+                draw.rectangle([128,38,130,248], fill=(180,180,180))
+                for col in range(2):
+                    xo = col*133
+                    draw.rectangle([xo+5,38,xo+122,95],
+                                   fill=(210,210,210))
+                    for line in range(9):
+                        y  = 100 + line*14
+                        w  = np.random.randint(70,118)
+                        gv = np.random.randint(40,90)
+                        draw.rectangle([xo+5,y,xo+w,y+9],
+                                       fill=(gv,gv,gv))
+
+            elif doc_type in ['presentation','poster','flyer']:
+                bg_c = tuple(np.random.randint(80,180,3).tolist())
+                img  = Image.new('RGB', (256,256), bg_c)
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([0,0,256,60], fill=(0,0,0))
+                draw.rectangle([8,8,248,52], fill=(255,255,255))
+                draw.rectangle([8,68,248,68+np.random.randint(40,80)],
+                               fill=(255,255,255))
+                for block in range(3):
+                    x = 8 + block*83
+                    draw.rectangle([x,165,x+75,235],
+                                   fill=(255,255,255))
+                draw.rectangle([0,242,256,256], fill=(30,30,30))
+
+            elif doc_type in ['blueprint','map_legend']:
+                img  = Image.new('RGB', (256,256), (30,50,100))
+                draw = ImageDraw.Draw(img)
+                for i in range(0,256,16):
+                    draw.line([(0,i),(256,i)], fill=(50,80,140), width=1)
+                    draw.line([(i,0),(i,256)], fill=(50,80,140), width=1)
+                shapes = [
+                    (20,20,100,80), (120,20,220,80),
+                    (20,100,80,180), (100,100,200,200),
+                    (210,100,250,180)
+                ]
+                for rect in shapes:
+                    draw.rectangle(rect, outline=(100,200,255), width=2)
+                for i in range(5):
+                    y = 20+i*45
+                    draw.line([(20,y),(220,y)],
+                              fill=(255,255,100), width=1)
+
+            elif doc_type in ['code_listing']:
+                img  = Image.new('RGB', (256,256), (30,30,40))
+                draw = ImageDraw.Draw(img)
+                line_colors = [
+                    (100,200,100),(150,150,255),(255,180,50),
+                    (200,200,200),(255,100,100),(100,255,200)
+                ]
+                for line in range(16):
+                    y      = 10 + line*15
+                    indent = np.random.randint(0,4) * 8
+                    lw     = np.random.randint(60,220)
+                    col    = line_colors[line%len(line_colors)]
+                    draw.rectangle(
+                        [10+indent, y, 10+indent+lw, y+9],
+                        fill=col
+                    )
+
+            elif doc_type in ['music_sheet']:
+                draw.rectangle([0,0,256,256], fill=(255,252,240))
+                for staff in range(3):
+                    y_base = 30 + staff*80
+                    for line in range(5):
+                        y = y_base + line*8
+                        draw.line([(10,y),(246,y)],
+                                  fill=(0,0,0), width=1)
+                    for note in range(np.random.randint(4,8)):
+                        x  = 20 + note*30
+                        yn = y_base + np.random.randint(0,40)
+                        draw.ellipse([x,yn,x+8,yn+6],
+                                     fill=(0,0,0))
+
             else:
-                # Generic professional layout
-                draw.rectangle([0,0,256,30], fill=accent)
+                draw.rectangle([0,0,256,32], fill=accent)
                 for section in range(4):
                     y = 40 + section*52
-                    draw.rectangle([10,y,246,y+45],
+                    draw.rectangle([8,y,248,y+48],
                                    outline=(180,180,180), width=1)
-                    draw.rectangle([15,y+5,200,y+15],
-                                   fill=(80,80,80))
+                    draw.rectangle([12,y+5,210,y+16],
+                                   fill=dark)
                     for line in range(2):
+                        lw = np.random.randint(80,235)
                         draw.rectangle(
-                            [15, y+20+line*12,
-                             np.random.randint(100,230),
-                             y+28+line*12],
-                            fill=(150,150,150)
+                            [12, y+22+line*13,
+                             lw, y+30+line*13],
+                            fill=(140,140,140)
                         )
 
-            # Apply quality enhancements
             img = img.filter(ImageFilter.SMOOTH)
-            enhancer = ImageEnhance.Sharpness(img)
-            img = enhancer.enhance(1.3)
-
+            img = ImageEnhance.Sharpness(img).enhance(1.4)
+            img = ImageEnhance.Contrast(img).enhance(1.1)
             img.save(
                 f"{folder}/type{type_idx:02d}_v{variant:03d}.jpg",
-                quality=95
+                quality=97
             )
             count += 1
 
     print(f"  Documents ready: {count}")
 
 
-# ── DATA LOADER ──────────────────────────────
+# ── DATA LOADER — SINGLE TYPE ─────────────────
 
-def load_all_training_data(max_per_type=500):
-    """Load high quality samples from all folders"""
-    folders = [
-        ("training_images",            "Images"),
-        ("training_data/video_frames", "Video "),
-        ("training_data/spectrograms", "Audio "),
-        ("training_data/documents",    "Docs  "),
-    ]
-    all_tensors = []
-    for folder, name in folders:
-        if not os.path.exists(folder):
-            print(f"  {name}: folder missing")
-            continue
-        count = 0
-        files = [f for f in os.listdir(folder)
-                 if f.lower().endswith(('.jpg','.jpeg','.png'))]
-        np.random.shuffle(files)
+def load_phase_data(phase, max_samples=500):
+    """Load training data for one phase only"""
+    folder_map = {
+        "images":    "training_images",
+        "video":     "training_data/video_frames",
+        "audio":     "training_data/spectrograms",
+        "documents": "training_data/documents",
+    }
+    folder = folder_map[phase]
+    if not os.path.exists(folder):
+        print(f"  Folder missing: {folder}")
+        return []
 
-        for fname in files[:max_per_type]:
-            try:
-                img = Image.open(
-                    os.path.join(folder, fname)
-                ).convert('RGB').resize(
-                    (IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS
-                )
-                t = torch.FloatTensor(
-                    np.array(img)/255.0
-                ).permute(2,0,1).unsqueeze(0)
-                all_tensors.append(t)
-                count += 1
-            except:
-                pass
-
-        print(f"  {name}: {count:,} samples loaded")
-    return all_tensors
+    files = [f for f in os.listdir(folder)
+             if f.lower().endswith(('.jpg','.jpeg','.png'))]
+    np.random.shuffle(files)
+    tensors = []
+    for fname in files[:max_samples]:
+        try:
+            img = Image.open(
+                os.path.join(folder, fname)
+            ).convert('RGB').resize(
+                (IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS
+            )
+            t = torch.FloatTensor(
+                np.array(img)/255.0
+            ).permute(2,0,1).unsqueeze(0)
+            tensors.append(t)
+        except:
+            pass
+    print(f"  {phase.capitalize()}: {len(tensors):,} samples loaded")
+    return tensors
 
 
-# ── TRAINING LOOP ────────────────────────────
+# ── PREPARE DATA FOR PHASE ────────────────────
 
-def train(epochs=2000, batch_size=16):
-    print("\n" + "="*55)
-    print("UNIVERSAL FOUNDATION TRAINER v5.3")
-    print("50 Categories per file type")
-    print("Maximum quality training")
+def prepare_phase_data(phase):
+    """Generate or download data for the given phase"""
+    if phase == "images":
+        download_images(target=1000)
+    elif phase == "video":
+        generate_video_frames(target=1000)
+    elif phase == "audio":
+        generate_spectrograms(target=1000)
+    elif phase == "documents":
+        generate_documents(target=1000)
+
+
+# ── SINGLE PHASE TRAINING ─────────────────────
+
+def train_phase(phase, epochs=500, batch_size=64):
+    """
+    Train foundation on one file type.
+    Loads existing weights and continues from checkpoint.
+    Saves weights after every improvement.
+    """
+    ckpt_path = f"{CHECKPOINT_PATH}.{phase}"
+
+    print(f"\n{'='*55}")
+    print(f"PHASE: {phase.upper()}")
+    print(f"Epochs: {epochs}  Batch: {batch_size}")
     print(f"Device: {DEVICE}")
-    print("Inventor: Rohit Kalu Sasane, Pune India 2026")
-    print("="*55)
+    print(f"{'='*55}")
 
-    # Generate all training data
-    print("\nPreparing training data...")
-    download_images_diverse(target_per_category=20)
-    generate_video_frames(target=1000)
-    generate_spectrograms(target=1000)
-    generate_documents(target=1000)
+    # Prepare and load data for this phase
+    print(f"\nPreparing {phase} data...")
+    prepare_phase_data(phase)
+    tensors = load_phase_data(phase, max_samples=500)
 
-    # Load data
-    print("\nLoading training data...")
-    tensors = load_all_training_data(max_per_type=500)
-    total   = len(tensors)
-    print(f"\nTotal training samples: {total:,}")
-
-    if total == 0:
-        print("No training data found.")
+    if not tensors:
+        print(f"  No data for phase {phase}. Skipping.")
         return
 
-    foundation = Foundation().to(DEVICE)
+    total = len(tensors)
 
+    # Build model and optimizer
+    foundation  = Foundation().to(DEVICE)
+    optimizer   = torch.optim.Adam(
+        foundation.parameters(), lr=0.001, weight_decay=1e-5
+    )
+    # Fixed T_max=2000 so scheduler works even if
+    # you increase epochs beyond 500 later
+    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=2000, eta_min=1e-5
+    )
+    loss_fn     = nn.MSELoss()
+    best_loss   = float('inf')
+    start_epoch = 0
+
+    # Load existing weights — keeps all previous learning
     if os.path.exists(SAVE_PATH):
         try:
             foundation.load_state_dict(
                 torch.load(SAVE_PATH, map_location=DEVICE,
                            weights_only=True)
             )
-            print("Continuing from existing weights")
+            print(f"  Weights loaded from previous training")
         except:
-            print("Starting fresh")
+            print(f"  Weights incompatible — starting fresh")
     else:
-        print("Fresh training start")
+        print(f"  No weights found — fresh start")
 
-    optimizer = torch.optim.Adam(
-        foundation.parameters(), lr=0.001,
-        weight_decay=1e-5
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=1e-5
-    )
-    loss_fn   = nn.MSELoss()
-    best_loss = float('inf')
+    # Load phase checkpoint — exact epoch + optimizer state
+    if os.path.exists(ckpt_path):
+        try:
+            ckpt = torch.load(
+                ckpt_path, map_location=DEVICE,
+                weights_only=False
+            )
+            optimizer.load_state_dict(ckpt['optimizer'])
+            scheduler.load_state_dict(ckpt['scheduler'])
+            start_epoch = ckpt['epoch'] + 1
+            best_loss   = ckpt['best_loss']
+            print(f"  Resuming {phase} from epoch "
+                  f"{start_epoch}/{epochs} "
+                  f"— best loss: {best_loss:.6f}")
+        except:
+            print(f"  No checkpoint — fresh optimizer for {phase}")
+    else:
+        print(f"  No checkpoint — fresh optimizer for {phase}")
 
-    print(f"\nEpochs:    {epochs}")
-    print(f"Batch:     {batch_size}")
-    print(f"Samples:   {total:,}")
-    print(f"GPU time:  ~2-3 hours")
-    print(f"CPU time:  ~12+ hours\n")
+    if start_epoch >= epochs:
+        print(f"  Phase {phase} already complete "
+              f"({epochs} epochs done).")
+        print(f"  To train more: increase epochs.")
+        return
 
-    for epoch in range(epochs):
+    print(f"\n  Epochs:  {start_epoch} → {epochs}")
+    print(f"  Samples: {total:,}")
+    print()
+
+    for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
         np.random.shuffle(tensors)
         batches = 0
@@ -869,34 +939,77 @@ def train(epochs=2000, batch_size=16):
 
         if avg < best_loss:
             best_loss = avg
+            # Save weights — shared across all phases
             atomic_save(foundation.state_dict(), SAVE_PATH)
+            # Save phase-specific checkpoint
+            torch.save({
+                'epoch':     epoch,
+                'best_loss': best_loss,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'phase':     phase,
+            }, ckpt_path)
 
         if (epoch+1) % 100 == 0:
             lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1:>5}/{epochs} — "
+            print(f"  Epoch {epoch+1:>5}/{epochs} — "
                   f"Loss: {avg:.6f}  "
                   f"Best: {best_loss:.6f}  "
                   f"LR: {lr:.7f}")
 
     sz = os.path.getsize(SAVE_PATH)
-    print(f"\n{'='*55}")
-    print(f"Training complete!")
-    print(f"Best loss:    {best_loss:.6f}")
-    print(f"Foundation:   {sz/1024/1024:.1f}MB")
-    print(f"Trained on:   {total:,} samples")
-    print(f"Categories:   50 per file type")
-    print(f"File types:   Images+Video+Audio+Documents")
-    print(f"{'='*55}")
+    print(f"\n  Phase {phase} complete!")
+    print(f"  Best loss:  {best_loss:.6f}")
+    print(f"  Weights:    {sz/1024/1024:.1f}MB")
+    print(f"  To train more: increase epochs and run again")
 
+
+# ── CURRICULUM TRAINER ────────────────────────
+
+def train_curriculum(epochs_per_phase=500, batch_size=64):
+    """
+    Train one phase at a time in order:
+    images → video → audio → documents
+    Each phase builds on the previous.
+    All phases share one weight file.
+    Each phase has its own checkpoint.
+    """
+    print("\n" + "="*55)
+    print("UNIVERSAL FOUNDATION TRAINER v5.6")
+    print("CURRICULUM LEARNING — one type at a time")
+    print(f"Phases:  {' → '.join(PHASES)}")
+    print(f"Epochs per phase: {epochs_per_phase}")
+    print(f"Device: {DEVICE}")
+    print("Inventor: Rohit Kalu Sasane, Pune India 2026")
+    print("="*55)
+
+    for phase in PHASES:
+        train_phase(phase, epochs=epochs_per_phase,
+                    batch_size=batch_size)
+
+    print("\n" + "="*55)
+    print("ALL PHASES COMPLETE")
+    print(f"Foundation trained on all file types")
+    print(f"Weights: {SAVE_PATH}")
+    print("="*55)
+
+
+# ── MAIN ─────────────────────────────────────
 
 if __name__ == "__main__":
-    if os.path.exists(SAVE_PATH):
-        print(f"Weights exist: {SAVE_PATH}")
-        print("Generating data only. Delete weights to retrain.\n")
-        download_images_diverse(target_per_category=20)
-        generate_video_frames(target=1000)
-        generate_spectrograms(target=1000)
-        generate_documents(target=1000)
-        print("\nAll data ready.")
+    # Usage:
+    #   python train_foundation.py            — run all phases
+    #   python train_foundation.py images     — images only
+    #   python train_foundation.py video      — video only
+    #   python train_foundation.py audio      — audio only
+    #   python train_foundation.py documents  — documents only
+
+    if len(sys.argv) > 1:
+        phase = sys.argv[1].lower()
+        if phase not in PHASES:
+            print(f"Unknown phase: {phase}")
+            print(f"Valid phases: {', '.join(PHASES)}")
+        else:
+            train_phase(phase, epochs=1000, batch_size=64)
     else:
-        train(epochs=2000, batch_size=16)
+        train_curriculum(epochs_per_phase=1000, batch_size=64)
