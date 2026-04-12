@@ -5,14 +5,20 @@ from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 import os
 import sys
 import tempfile
+import random
 
 # ============================================
-# UNIVERSAL FOUNDATION TRAINER v5.6
+# UNIVERSAL FOUNDATION TRAINER v5.7
 # CURRICULUM LEARNING — ONE TYPE AT A TIME
 # Phase 1: Images   — master visual patterns
 # Phase 2: Video    — add motion knowledge
 # Phase 3: Audio    — add frequency knowledge
 # Phase 4: Documents — add layout knowledge
+# NEW: Data augmentation — 3x effective dataset
+# NEW: Validation split — prevents overfitting
+# NEW: Early stopping — saves time on plateau
+# NEW: Perceptual loss — better visual quality
+# NEW: ReduceLROnPlateau — smarter learning rate
 # Auto-resume from exact checkpoint
 # Never loses progress on restart
 # Inventor: Rohit Kalu Sasane, Pune India 2026
@@ -22,9 +28,17 @@ SAVE_PATH       = "foundation_v4_weights.pth"
 CHECKPOINT_PATH = "foundation_v4_weights.pth.checkpoint"
 IMAGE_SIZE      = 256
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PHASES          = ["images", "video", "audio", "documents"]
 
-# Training phases in order
-PHASES = ["images", "video", "audio", "documents"]
+# ── TRAINING CONFIG ───────────────────────────
+# Change these to tune training
+EPOCHS_PER_PHASE  = 2000   # max epochs per phase
+BATCH_SIZE        = 64     # images per update
+MAX_SAMPLES       = 500    # images loaded per phase
+PATIENCE          = 150    # early stopping patience
+VAL_SPLIT         = 0.15   # 15% validation set
+AUGMENT_FACTOR    = 3      # how many augmented copies per image
+PRINT_EVERY       = 50     # print progress every N epochs
 
 
 # ── ARCHITECTURE ─────────────────────────────
@@ -127,6 +141,113 @@ def atomic_save(state_dict, path):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise e
+
+
+# ── COMBINED LOSS — MSE + SSIM ───────────────
+
+class CombinedLoss(nn.Module):
+    """
+    MSE + Structural Similarity loss.
+    MSE:  pixel accuracy
+    SSIM: structural/perceptual quality
+    Combined gives better visual results than MSE alone.
+    Weight: 0.8 MSE + 0.2 SSIM
+    """
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def ssim_loss(self, x, y):
+        # Simplified SSIM — mean and variance based
+        mu_x  = x.mean(dim=[2,3], keepdim=True)
+        mu_y  = y.mean(dim=[2,3], keepdim=True)
+        var_x = ((x - mu_x)**2).mean(dim=[2,3], keepdim=True)
+        var_y = ((y - mu_y)**2).mean(dim=[2,3], keepdim=True)
+        cov   = ((x - mu_x) * (y - mu_y)).mean(dim=[2,3], keepdim=True)
+        c1, c2 = 0.01**2, 0.03**2
+        ssim  = (
+            (2*mu_x*mu_y + c1) * (2*cov + c2)
+        ) / (
+            (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
+        )
+        return 1 - ssim.mean()
+
+    def forward(self, pred, target):
+        mse_loss  = self.mse(pred, target)
+        ssim_loss = self.ssim_loss(pred, target)
+        # 80% pixel accuracy + 20% structural quality
+        return 0.8 * mse_loss + 0.2 * ssim_loss
+
+
+# ── DATA AUGMENTATION ─────────────────────────
+
+def augment_tensor(t):
+    """
+    Generate augmented versions of one image tensor.
+    Returns list of augmented tensors.
+    All augmentations preserve image content —
+    just change appearance slightly.
+    """
+    img = Image.fromarray(
+        (t.squeeze(0).permute(1,2,0).numpy() * 255).astype(np.uint8)
+    )
+    augmented = []
+
+    # 1. Horizontal flip
+    flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
+    augmented.append(
+        torch.FloatTensor(
+            np.array(flipped)/255.0
+        ).permute(2,0,1).unsqueeze(0)
+    )
+
+    # 2. Random brightness
+    factor = random.uniform(0.80, 1.20)
+    bright = ImageEnhance.Brightness(img).enhance(factor)
+    augmented.append(
+        torch.FloatTensor(
+            np.array(bright)/255.0
+        ).permute(2,0,1).unsqueeze(0)
+    )
+
+    # 3. Random contrast
+    factor = random.uniform(0.85, 1.15)
+    contrast = ImageEnhance.Contrast(img).enhance(factor)
+    augmented.append(
+        torch.FloatTensor(
+            np.array(contrast)/255.0
+        ).permute(2,0,1).unsqueeze(0)
+    )
+
+    # 4. Slight rotation (±10 degrees)
+    angle = random.uniform(-10, 10)
+    rotated = img.rotate(angle, resample=Image.BILINEAR,
+                         fillcolor=(128,128,128))
+    augmented.append(
+        torch.FloatTensor(
+            np.array(rotated)/255.0
+        ).permute(2,0,1).unsqueeze(0)
+    )
+
+    # 5. Random color shift
+    factor = random.uniform(0.85, 1.15)
+    colored = ImageEnhance.Color(img).enhance(factor)
+    augmented.append(
+        torch.FloatTensor(
+            np.array(colored)/255.0
+        ).permute(2,0,1).unsqueeze(0)
+    )
+
+    # 6. Vertical flip (less common but adds diversity)
+    if random.random() > 0.5:
+        vflipped = img.transpose(Image.FLIP_TOP_BOTTOM)
+        augmented.append(
+            torch.FloatTensor(
+                np.array(vflipped)/255.0
+            ).permute(2,0,1).unsqueeze(0)
+        )
+
+    return augmented
 
 
 # ── HIGH QUALITY IMAGES ───────────────────────
@@ -345,7 +466,6 @@ def generate_video_frames(target=1000):
                 h = (r*8 + t*2) % 1.0
                 s = np.ones_like(h) * 0.9
                 v = np.ones_like(h) * 0.8
-                # HSV to RGB — full conversion kept
                 hi = (h*6).astype(int) % 6
                 f  = h*6 - hi.astype(float)
                 p  = v*(1-s)
@@ -377,7 +497,6 @@ def generate_video_frames(target=1000):
                 img[:,:,2] = np.clip((1-heat)*2, 0, 1)
 
             else:
-                # Rich colorful default
                 r = np.sin(x*pi*(pat_idx%5+2) + t*2*pi)*0.5+0.5
                 g = np.cos(y*pi*(pat_idx%4+3) + t*pi)*0.5+0.5
                 b = np.sin((x+y)*pi*(pat_idx%3+2) + t*3*pi)*0.5+0.5
@@ -780,10 +899,15 @@ def generate_documents(target=1000):
     print(f"  Documents ready: {count}")
 
 
-# ── DATA LOADER — SINGLE TYPE ─────────────────
+# ── DATA LOADER WITH AUGMENTATION ────────────
 
 def load_phase_data(phase, max_samples=500):
-    """Load training data for one phase only"""
+    """
+    Load training data for one phase.
+    Applies augmentation to multiply effective dataset.
+    Splits into train/val sets.
+    Returns: train_tensors, val_tensors
+    """
     folder_map = {
         "images":    "training_images",
         "video":     "training_data/video_frames",
@@ -793,13 +917,16 @@ def load_phase_data(phase, max_samples=500):
     folder = folder_map[phase]
     if not os.path.exists(folder):
         print(f"  Folder missing: {folder}")
-        return []
+        return [], []
 
     files = [f for f in os.listdir(folder)
              if f.lower().endswith(('.jpg','.jpeg','.png'))]
-    np.random.shuffle(files)
-    tensors = []
-    for fname in files[:max_samples]:
+    random.shuffle(files)
+    files = files[:max_samples]
+
+    # Load base tensors
+    base_tensors = []
+    for fname in files:
         try:
             img = Image.open(
                 os.path.join(folder, fname)
@@ -809,17 +936,43 @@ def load_phase_data(phase, max_samples=500):
             t = torch.FloatTensor(
                 np.array(img)/255.0
             ).permute(2,0,1).unsqueeze(0)
-            tensors.append(t)
+            base_tensors.append(t)
         except:
             pass
-    print(f"  {phase.capitalize()}: {len(tensors):,} samples loaded")
-    return tensors
+
+    if not base_tensors:
+        return [], []
+
+    # ── Validation split — before augmentation ──
+    # Val set uses ONLY original images — no augmentation
+    # This gives honest evaluation on unseen variations
+    n_val   = max(1, int(len(base_tensors) * VAL_SPLIT))
+    n_train = len(base_tensors) - n_val
+    random.shuffle(base_tensors)
+    val_tensors   = base_tensors[:n_val]
+    train_base    = base_tensors[n_val:]
+
+    # ── Augmentation on train set only ──
+    train_tensors = list(train_base)
+    for t in train_base:
+        augmented = augment_tensor(t)
+        train_tensors.extend(augmented)
+
+    random.shuffle(train_tensors)
+
+    print(f"  {phase.capitalize()}:")
+    print(f"    Base:  {len(base_tensors)} images")
+    print(f"    Train: {len(train_tensors)} "
+          f"(after augmentation)")
+    print(f"    Val:   {len(val_tensors)} "
+          f"(original only — honest eval)")
+
+    return train_tensors, val_tensors
 
 
 # ── PREPARE DATA FOR PHASE ────────────────────
 
 def prepare_phase_data(phase):
-    """Generate or download data for the given phase"""
     if phase == "images":
         download_images(target=1000)
     elif phase == "video":
@@ -830,61 +983,107 @@ def prepare_phase_data(phase):
         generate_documents(target=1000)
 
 
+# ── VALIDATION LOSS ───────────────────────────
+
+def compute_val_loss(foundation, val_tensors,
+                     loss_fn, batch_size=64):
+    """
+    Compute loss on validation set.
+    No gradient computation — faster.
+    """
+    foundation.eval()
+    total_loss = 0.0
+    batches    = 0
+    with torch.no_grad():
+        for i in range(0, len(val_tensors), batch_size):
+            batch_list = val_tensors[i:i+batch_size]
+            if not batch_list:
+                continue
+            batch = torch.cat(batch_list).to(DEVICE)
+            out, *_ = foundation(batch)
+            loss = loss_fn(out, batch)
+            total_loss += loss.item()
+            batches    += 1
+    return total_loss / max(batches, 1)
+
+
 # ── SINGLE PHASE TRAINING ─────────────────────
 
-def train_phase(phase, epochs=500, batch_size=64):
+def train_phase(phase, epochs=EPOCHS_PER_PHASE,
+                batch_size=BATCH_SIZE):
     """
     Train foundation on one file type.
-    Loads existing weights and continues from checkpoint.
-    Saves weights after every improvement.
+    Features:
+      - Data augmentation (3x dataset)
+      - Validation split (honest evaluation)
+      - Early stopping (prevents overfitting)
+      - Combined MSE+SSIM loss (better quality)
+      - ReduceLROnPlateau (smarter LR)
+      - Checkpoint resume (never loses progress)
     """
     ckpt_path = f"{CHECKPOINT_PATH}.{phase}"
 
     print(f"\n{'='*55}")
     print(f"PHASE: {phase.upper()}")
-    print(f"Epochs: {epochs}  Batch: {batch_size}")
+    print(f"Max epochs: {epochs}  "
+          f"Batch: {batch_size}  "
+          f"Patience: {PATIENCE}")
     print(f"Device: {DEVICE}")
     print(f"{'='*55}")
 
-    # Prepare and load data for this phase
     print(f"\nPreparing {phase} data...")
     prepare_phase_data(phase)
-    tensors = load_phase_data(phase, max_samples=500)
+    train_tensors, val_tensors = load_phase_data(
+        phase, max_samples=MAX_SAMPLES
+    )
 
-    if not tensors:
+    if not train_tensors:
         print(f"  No data for phase {phase}. Skipping.")
         return
 
-    total = len(tensors)
+    # ── Build model ───────────────────────────
+    foundation = Foundation().to(DEVICE)
 
-    # Build model and optimizer
-    foundation  = Foundation().to(DEVICE)
-    optimizer   = torch.optim.Adam(
-        foundation.parameters(), lr=0.001, weight_decay=1e-5
-    )
-    # Fixed T_max=2000 so scheduler works even if
-    # you increase epochs beyond 500 later
-    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=2000, eta_min=1e-5
-    )
-    loss_fn     = nn.MSELoss()
-    best_loss   = float('inf')
-    start_epoch = 0
+    # ── Combined loss — better visual quality ──
+    loss_fn = CombinedLoss().to(DEVICE)
 
-    # Load existing weights — keeps all previous learning
+    # ── Adam optimizer ────────────────────────
+    optimizer = torch.optim.Adam(
+        foundation.parameters(),
+        lr=0.001, weight_decay=1e-5
+    )
+
+    # ── ReduceLROnPlateau ─────────────────────
+    # Drops LR when val_loss stops improving
+    # More responsive than CosineAnnealing
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',        # minimize val_loss
+        factor=0.5,        # halve LR on plateau
+        patience=30,       # wait 30 epochs before dropping
+        min_lr=1e-6,       # never go below this
+        verbose=False
+    )
+
+    best_train_loss = float('inf')
+    best_val_loss   = float('inf')
+    start_epoch     = 0
+    no_improve      = 0   # early stopping counter
+
+    # ── Load existing weights ─────────────────
     if os.path.exists(SAVE_PATH):
         try:
             foundation.load_state_dict(
                 torch.load(SAVE_PATH, map_location=DEVICE,
                            weights_only=True)
             )
-            print(f"  Weights loaded from previous training")
+            print(f"  Weights loaded")
         except:
             print(f"  Weights incompatible — starting fresh")
     else:
-        print(f"  No weights found — fresh start")
+        print(f"  Fresh start")
 
-    # Load phase checkpoint — exact epoch + optimizer state
+    # ── Load phase checkpoint ─────────────────
     if os.path.exists(ckpt_path):
         try:
             ckpt = torch.load(
@@ -893,33 +1092,39 @@ def train_phase(phase, epochs=500, batch_size=64):
             )
             optimizer.load_state_dict(ckpt['optimizer'])
             scheduler.load_state_dict(ckpt['scheduler'])
-            start_epoch = ckpt['epoch'] + 1
-            best_loss   = ckpt['best_loss']
-            print(f"  Resuming {phase} from epoch "
-                  f"{start_epoch}/{epochs} "
-                  f"— best loss: {best_loss:.6f}")
-        except:
-            print(f"  No checkpoint — fresh optimizer for {phase}")
+            start_epoch     = ckpt['epoch'] + 1
+            best_val_loss   = ckpt['best_val_loss']
+            best_train_loss = ckpt.get('best_train_loss',
+                                       float('inf'))
+            no_improve      = ckpt.get('no_improve', 0)
+            print(f"  Resuming from epoch {start_epoch}/{epochs}"
+                  f" — best val: {best_val_loss:.6f}"
+                  f" — no_improve: {no_improve}/{PATIENCE}")
+        except Exception as e:
+            print(f"  No checkpoint — fresh optimizer ({e})")
     else:
-        print(f"  No checkpoint — fresh optimizer for {phase}")
+        print(f"  No checkpoint — fresh optimizer")
 
     if start_epoch >= epochs:
-        print(f"  Phase {phase} already complete "
-              f"({epochs} epochs done).")
-        print(f"  To train more: increase epochs.")
+        print(f"  Already completed {epochs} epochs.")
+        print(f"  Increase EPOCHS_PER_PHASE to train more.")
         return
 
     print(f"\n  Epochs:  {start_epoch} → {epochs}")
-    print(f"  Samples: {total:,}")
+    print(f"  Train:   {len(train_tensors):,} samples")
+    print(f"  Val:     {len(val_tensors):,} samples")
     print()
 
     for epoch in range(start_epoch, epochs):
+
+        # ── TRAINING PASS ─────────────────────
+        foundation.train()
         epoch_loss = 0.0
-        np.random.shuffle(tensors)
+        random.shuffle(train_tensors)
         batches = 0
 
-        for i in range(0, total, batch_size):
-            batch_list = tensors[i:i+batch_size]
+        for i in range(0, len(train_tensors), batch_size):
+            batch_list = train_tensors[i:i+batch_size]
             if not batch_list:
                 continue
             batch = torch.cat(batch_list).to(DEVICE)
@@ -934,62 +1139,87 @@ def train_phase(phase, epochs=500, batch_size=64):
             epoch_loss += loss.item()
             batches    += 1
 
-        scheduler.step()
-        avg = epoch_loss / max(batches, 1)
+        train_avg = epoch_loss / max(batches, 1)
 
-        if avg < best_loss:
-            best_loss = avg
-            # Save weights — shared across all phases
+        # ── VALIDATION PASS ───────────────────
+        val_avg = compute_val_loss(
+            foundation, val_tensors, loss_fn, batch_size
+        )
+        foundation.train()
+
+        # ── LR SCHEDULER step ─────────────────
+        # Uses val_loss for smarter LR adjustment
+        scheduler.step(val_avg)
+
+        # ── SAVE if val_loss improved ──────────
+        if val_avg < best_val_loss:
+            best_val_loss   = val_avg
+            best_train_loss = train_avg
+            no_improve      = 0
             atomic_save(foundation.state_dict(), SAVE_PATH)
-            # Save phase-specific checkpoint
             torch.save({
-                'epoch':     epoch,
-                'best_loss': best_loss,
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'phase':     phase,
+                'epoch':           epoch,
+                'best_val_loss':   best_val_loss,
+                'best_train_loss': best_train_loss,
+                'no_improve':      no_improve,
+                'optimizer':       optimizer.state_dict(),
+                'scheduler':       scheduler.state_dict(),
+                'phase':           phase,
             }, ckpt_path)
+        else:
+            no_improve += 1
 
-        if (epoch+1) % 100 == 0:
+        # ── PRINT PROGRESS ────────────────────
+        if (epoch+1) % PRINT_EVERY == 0:
             lr = optimizer.param_groups[0]['lr']
             print(f"  Epoch {epoch+1:>5}/{epochs} — "
-                  f"Loss: {avg:.6f}  "
-                  f"Best: {best_loss:.6f}  "
-                  f"LR: {lr:.7f}")
+                  f"Train: {train_avg:.6f}  "
+                  f"Val: {val_avg:.6f}  "
+                  f"Best: {best_val_loss:.6f}  "
+                  f"LR: {lr:.7f}  "
+                  f"Patience: {no_improve}/{PATIENCE}")
+
+        # ── EARLY STOPPING ────────────────────
+        if no_improve >= PATIENCE:
+            print(f"\n  Early stopping at epoch {epoch+1}")
+            print(f"  Val loss not improved for "
+                  f"{PATIENCE} epochs")
+            print(f"  Best val loss: {best_val_loss:.6f}")
+            break
 
     sz = os.path.getsize(SAVE_PATH)
     print(f"\n  Phase {phase} complete!")
-    print(f"  Best loss:  {best_loss:.6f}")
-    print(f"  Weights:    {sz/1024/1024:.1f}MB")
-    print(f"  To train more: increase epochs and run again")
+    print(f"  Best val loss:   {best_val_loss:.6f}")
+    print(f"  Best train loss: {best_train_loss:.6f}")
+    print(f"  Weights:         {sz/1024/1024:.1f}MB")
+    print(f"  Augmented data:  {len(train_tensors):,} samples")
 
 
 # ── CURRICULUM TRAINER ────────────────────────
 
-def train_curriculum(epochs_per_phase=500, batch_size=64):
-    """
-    Train one phase at a time in order:
-    images → video → audio → documents
-    Each phase builds on the previous.
-    All phases share one weight file.
-    Each phase has its own checkpoint.
-    """
+def train_curriculum(epochs_per_phase=EPOCHS_PER_PHASE,
+                     batch_size=BATCH_SIZE):
     print("\n" + "="*55)
-    print("UNIVERSAL FOUNDATION TRAINER v5.6")
+    print("UNIVERSAL FOUNDATION TRAINER v5.7")
     print("CURRICULUM LEARNING — one type at a time")
-    print(f"Phases:  {' → '.join(PHASES)}")
-    print(f"Epochs per phase: {epochs_per_phase}")
-    print(f"Device: {DEVICE}")
+    print(f"Phases:        {' → '.join(PHASES)}")
+    print(f"Max epochs:    {epochs_per_phase} per phase")
+    print(f"Early stop:    {PATIENCE} patience")
+    print(f"Augmentation:  {AUGMENT_FACTOR}x dataset")
+    print(f"Val split:     {int(VAL_SPLIT*100)}%")
+    print(f"Loss:          MSE + SSIM combined")
+    print(f"LR schedule:   ReduceLROnPlateau")
+    print(f"Device:        {DEVICE}")
     print("Inventor: Rohit Kalu Sasane, Pune India 2026")
     print("="*55)
 
     for phase in PHASES:
-        train_phase(phase, epochs=epochs_per_phase,
+        train_phase(phase,
+                    epochs=epochs_per_phase,
                     batch_size=batch_size)
 
     print("\n" + "="*55)
     print("ALL PHASES COMPLETE")
-    print(f"Foundation trained on all file types")
     print(f"Weights: {SAVE_PATH}")
     print("="*55)
 
@@ -998,7 +1228,7 @@ def train_curriculum(epochs_per_phase=500, batch_size=64):
 
 if __name__ == "__main__":
     # Usage:
-    #   python train_foundation.py            — run all phases
+    #   python train_foundation.py            — all phases
     #   python train_foundation.py images     — images only
     #   python train_foundation.py video      — video only
     #   python train_foundation.py audio      — audio only
@@ -1008,8 +1238,8 @@ if __name__ == "__main__":
         phase = sys.argv[1].lower()
         if phase not in PHASES:
             print(f"Unknown phase: {phase}")
-            print(f"Valid phases: {', '.join(PHASES)}")
+            print(f"Valid: {', '.join(PHASES)}")
         else:
-            train_phase(phase, epochs=1000, batch_size=64)
+            train_phase(phase)
     else:
-        train_curriculum(epochs_per_phase=1000, batch_size=64)
+        train_curriculum()
