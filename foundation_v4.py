@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 import os
 import struct
 import hashlib
@@ -34,8 +34,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 warnings.filterwarnings('ignore')
 
 # ============================================
-# UNIVERSAL NEURAL FOUNDATION v5.3
+# UNIVERSAL NEURAL FOUNDATION v5.4
 # ALL 13 CLAIMS + ALL FILE TYPES
+# Original dimensions preserved on reconstruct
 # Images, Video, Audio, Documents, Any file
 # Synced with train_foundation.py v5.6
 # Inventor: Rohit Kalu Sasane, Pune India 2026
@@ -44,8 +45,8 @@ warnings.filterwarnings('ignore')
 device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WEIGHTS      = "foundation_v4_weights.pth"
 MAGIC        = b'UNFC'
-FRAME_SAMPLE = 3    # compress every Nth frame
-MAX_PARENT_SCAN = 50  # max DNA files to scan for inheritance
+FRAME_SAMPLE = 3
+MAX_PARENT_SCAN = 50
 
 IMAGE_EXT    = {'jpg','jpeg','png','bmp','webp','gif','tiff'}
 VIDEO_EXT    = {'mp4','avi','mov','mkv','wmv','flv'}
@@ -209,9 +210,9 @@ def load_dna(path):
     with open(path, 'rb') as f:
         assert f.read(4) == MAGIC, "Invalid DNA file"
         _, enc_flag, pid = struct.unpack('BBB', f.read(3))
-        checksum = f.read(32).rstrip(b'\x00').decode()
+        checksum  = f.read(32).rstrip(b'\x00').decode()
         file_type = f.read(16).rstrip(b'\x00').decode()
-        raw = f.read(struct.unpack('I', f.read(4))[0])
+        raw       = f.read(struct.unpack('I', f.read(4))[0])
         if enc_flag:
             raw = DNA_Enc().dec(raw)
         dims = struct.unpack('HHH', raw[:6])
@@ -242,22 +243,14 @@ def load_dna(path):
 # ── CLAIM 7 — INHERITANCE ────────────────────
 
 def find_parent(g, r, d, folder=".", threshold=0.85):
-    """
-    Find similar existing DNA file.
-    Limited to MAX_PARENT_SCAN files for speed.
-    """
     best_sim, best = 0, None
     v1 = torch.cat([g.flatten(), r.flatten(), d.flatten()])
-
-    # Only scan .dna files — not .vdna or .adna
     dna_files = [
         f for f in os.listdir(folder)
         if f.endswith('.dna') and not f.endswith('.dna.txt')
     ]
-    # Limit scan for performance
     if len(dna_files) > MAX_PARENT_SCAN:
         dna_files = dna_files[:MAX_PARENT_SCAN]
-
     for fname in dna_files:
         try:
             result = load_dna(os.path.join(folder, fname))
@@ -427,10 +420,6 @@ def audio_to_chunks(audio_path, chunk_ms=1000):
 
 
 def chunk_to_image(chunk, size=256):
-    """
-    Convert audio chunk to RGB spectrogram image.
-    Uses all 3 channels for richer representation.
-    """
     if not PYDUB_AVAILABLE:
         return torch.zeros(1,3,size,size).to(device)
     samples = np.array(
@@ -441,17 +430,14 @@ def chunk_to_image(chunk, size=256):
     samples = samples / (np.max(np.abs(samples)) + 1e-8)
     samples = np.resize(samples, size*size)
     data    = samples.reshape(size, size)
-    # Use all 3 channels — more information for foundation
-    r_ch = ((data + 1) / 2 * 255).astype(np.uint8)
-    g_ch = (np.abs(data) * 255).astype(np.uint8)
-    b_ch = np.clip(
+    r_ch    = ((data + 1) / 2 * 255).astype(np.uint8)
+    g_ch    = (np.abs(data) * 255).astype(np.uint8)
+    b_ch    = np.clip(
         (1 - np.abs(data)) * 180 +
         np.abs(np.roll(data, 8, axis=1)) * 75,
         0, 255
     ).astype(np.uint8)
-    img = Image.fromarray(
-        np.stack([r_ch, g_ch, b_ch], axis=2)
-    )
+    img = Image.fromarray(np.stack([r_ch, g_ch, b_ch], axis=2))
     return torch.FloatTensor(
         np.array(img)/255.0
     ).permute(2,0,1).unsqueeze(0).to(device)
@@ -497,7 +483,7 @@ def text_to_image(text, size=256):
 
 
 def tensor_to_image(tensor, size=None):
-    """Convert tensor to PIL Image"""
+    """Convert tensor to PIL Image at foundation resolution"""
     arr = (
         torch.clamp(tensor, 0, 1)
         .squeeze(0).permute(1,2,0)
@@ -505,12 +491,40 @@ def tensor_to_image(tensor, size=None):
     ).astype(np.uint8)
     img = Image.fromarray(arr)
     if size:
-        img = img.resize((size, size))
+        img = img.resize((size, size), Image.LANCZOS)
     return img
 
 
+def restore_original_size(img, orig_w, orig_h):
+    """
+    Upscale reconstructed image back to original dimensions.
+    Uses LANCZOS for best quality.
+    Applies sharpening after upscale to recover perceived detail.
+    """
+    if orig_w and orig_h and (img.width != orig_w or img.height != orig_h):
+        img = img.resize((orig_w, orig_h), Image.LANCZOS)
+        # Recover sharpness lost during upscaling
+        img = img.filter(ImageFilter.SHARPEN)
+        img = ImageEnhance.Sharpness(img).enhance(1.2)
+        img = ImageEnhance.Contrast(img).enhance(1.05)
+    return img
+
+
+def restore_original_frame(arr, orig_w, orig_h):
+    """
+    Upscale video frame back to original dimensions.
+    Takes numpy array, returns numpy array.
+    """
+    if orig_w and orig_h and (arr.shape[1] != orig_w or arr.shape[0] != orig_h):
+        img = Image.fromarray(arr)
+        img = img.resize((orig_w, orig_h), Image.LANCZOS)
+        img = img.filter(ImageFilter.SHARPEN)
+        img = ImageEnhance.Sharpness(img).enhance(1.1)
+        arr = np.array(img)
+    return arr
+
+
 def detect_file_type(path):
-    """Auto detect file type from extension"""
     ext = path.split('.')[-1].lower()
     if ext in IMAGE_EXT:    return 'image'
     if ext in VIDEO_EXT:    return 'video'
@@ -524,10 +538,6 @@ def detect_file_type(path):
 def make_comparison(original_path, recon_tensor,
                     stage1_tensor, stage2_tensor,
                     stage3_tensor, out_path):
-    """
-    Build side by side comparison:
-    Original | Global-32 | Regional-288 | Full-800 | Reconstructed
-    """
     size = 256
     orig = Image.open(original_path).convert('RGB').resize((size,size))
     s1   = tensor_to_image(stage1_tensor, size)
@@ -555,7 +565,6 @@ def make_comparison(original_path, recon_tensor,
     for i, (img, label, color) in enumerate(items):
         x = padding + i * (size + padding)
         canvas.paste(img, (x, label_h + padding))
-        # Center label above image
         draw.text(
             (x + size//2, padding//2 + 5),
             label, fill=color, anchor="mt"
@@ -609,17 +618,13 @@ class System:
     # ── COMPRESS ANY FILE ─────────────────────
 
     def compress(self, path, encrypt=True):
-        """
-        Auto detect file type and compress to DNA.
-        Returns DNA file path.
-        """
         if not os.path.exists(path):
             print(f"  File not found: {path}")
             return None
 
-        ext      = path.split('.')[-1].lower()
-        ftype    = detect_file_type(path)
-        orig     = os.path.getsize(path)
+        ext   = path.split('.')[-1].lower()
+        ftype = detect_file_type(path)
+        orig  = os.path.getsize(path)
 
         print(f"\n{'='*50}")
         print(f"  File:  {os.path.basename(path)}")
@@ -639,6 +644,12 @@ class System:
             return self._compress_binary(path, encrypt, orig)
 
     def _compress_image(self, path, encrypt, orig):
+        # ── Store original dimensions before any resize ──
+        with Image.open(path) as raw_img:
+            orig_w, orig_h = raw_img.size
+            orig_format    = (raw_img.format or
+                              path.split('.')[-1].upper())
+
         t           = self.img_tensor(path)
         g, r, d     = self.f.encode(t)
         gc, rc, dc  = g.cpu(), r.cpu(), d.cpu()
@@ -649,11 +660,19 @@ class System:
         loss        = self.loss_fn(recon, t).item()
         checksum    = hashlib.md5(open(path,'rb').read()).hexdigest()
         dna         = path + ".dna"
+
+        # ── Original dimensions stored in DNA metadata ──
+        meta = {
+            'orig_w':      orig_w,
+            'orig_h':      orig_h,
+            'orig_format': orig_format,
+        }
         save_dna(
             dna, gc.squeeze(0), rc.squeeze(0), dc.squeeze(0),
-            checksum, pid, parent, encrypt, 'image'
+            checksum, pid, parent, encrypt, 'image', meta
         )
         dsz = os.path.getsize(dna)
+        print(f"  Original: {orig_w}×{orig_h}  ({orig_format})")
         print(f"  DNA:      {dsz/1024:.1f} KB  "
               f"({(1-dsz/orig)*100:.2f}% smaller)")
         print(f"  Loss:     {loss:.6f}")
@@ -663,13 +682,15 @@ class System:
         return dna
 
     def _compress_video(self, path, encrypt, orig):
-        if not cv2:
-            print("  cv2 not available — cannot compress video")
-            return None
-        cap       = cv2.VideoCapture(path)
-        fps       = cap.get(cv2.CAP_PROP_FPS)
-        total     = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration  = total / fps if fps > 0 else 0
+        cap      = cv2.VideoCapture(path)
+        fps      = cap.get(cv2.CAP_PROP_FPS)
+        total    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total / fps if fps > 0 else 0
+
+        # ── Store original video dimensions ──
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         frame_dnas = []
         frame_idx  = 0
         compressed = 0
@@ -696,11 +717,13 @@ class System:
 
         vdna = path + ".vdna"
         meta = {
-            'fps':           fps,
-            'total_frames':  total,
+            'fps':            fps,
+            'total_frames':   total,
             'sampled_frames': compressed,
-            'sample_rate':   FRAME_SAMPLE,
-            'duration':      duration
+            'sample_rate':    FRAME_SAMPLE,
+            'duration':       duration,
+            'orig_w':         orig_w,
+            'orig_h':         orig_h,
         }
         raw = json.dumps(
             {'meta': meta, 'frames': frame_dnas}
@@ -717,6 +740,7 @@ class System:
             f.write(raw)
 
         dsz = os.path.getsize(vdna)
+        print(f"  Original: {orig_w}×{orig_h}")
         print(f"  Frames:   {total} total → {compressed} compressed")
         print(f"  Duration: {duration:.1f}s at {fps:.0f}fps")
         print(f"  DNA:      {dsz/1024:.1f} KB  "
@@ -764,10 +788,10 @@ class System:
         return adna
 
     def _compress_document(self, path, encrypt, orig):
-        text        = extract_document_text(path)
-        t           = text_to_image(text)
-        g, r, d     = self.f.encode(t)
-        gc, rc, dc  = g.cpu(), r.cpu(), d.cpu()
+        text       = extract_document_text(path)
+        t          = text_to_image(text)
+        g, r, d    = self.f.encode(t)
+        gc, rc, dc = g.cpu(), r.cpu(), d.cpu()
         self.ml.update(t)
         meta     = {
             'text_length':  len(text),
@@ -818,7 +842,6 @@ class System:
     # ── RECONSTRUCT FROM DNA ──────────────────
 
     def reconstruct(self, dna_path, mode="full", out=None):
-        """Auto detect DNA type and reconstruct"""
         if dna_path.endswith('.vdna'):
             return self._reconstruct_video(dna_path, out)
         elif dna_path.endswith('.adna'):
@@ -827,12 +850,13 @@ class System:
             return self._reconstruct_image(dna_path, mode, out)
 
     def _reconstruct_image(self, dna, mode="full", out=None):
-        result  = load_dna(dna)
-        g, r, d = (result[0].to(device),
-                   result[1].to(device),
-                   result[2].to(device))
-        r0, d0  = torch.zeros_like(r), torch.zeros_like(d)
-        cfg     = MODES[mode]
+        result    = load_dna(dna)
+        g, r, d   = (result[0].to(device),
+                     result[1].to(device),
+                     result[2].to(device))
+        r0, d0    = torch.zeros_like(r), torch.zeros_like(d)
+        cfg       = MODES[mode]
+        meta      = result[7]
 
         if cfg["chains"] == "g":
             rec = self.f.decode(g, r0, d0)
@@ -841,7 +865,17 @@ class System:
         else:
             rec = self.f.decode(g, r, d)
 
+        # Reconstruct at foundation resolution first
         img = tensor_to_image(rec, cfg["size"])
+
+        # ── Restore original dimensions for full mode ──
+        if mode == "full":
+            orig_w = meta.get('orig_w')
+            orig_h = meta.get('orig_h')
+            if orig_w and orig_h:
+                img = restore_original_size(img, orig_w, orig_h)
+                print(f"  Restored:  {orig_w}×{orig_h}")
+
         if not out:
             out = dna.replace('.dna', f'_{mode}.png')
         img.save(out)
@@ -863,28 +897,35 @@ class System:
         data        = json.loads(raw.decode())
         meta        = data['meta']
         frames_data = data['frames']
-        frames      = []
 
+        # ── Read original video dimensions ──
+        orig_w = meta.get('orig_w')
+        orig_h = meta.get('orig_h')
+
+        frames = []
         for fd in frames_data:
             g   = torch.FloatTensor(fd['g']).unsqueeze(0).to(device)
             r   = torch.FloatTensor(fd['r']).unsqueeze(0).to(device)
             d   = torch.FloatTensor(fd['d']).unsqueeze(0).to(device)
             rec = self.f.decode(g, r, d)
-            frames.append(
-                (torch.clamp(rec,0,1).squeeze(0)
-                 .permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
-            )
+            arr = (torch.clamp(rec,0,1).squeeze(0)
+                   .permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
+
+            # ── Restore each frame to original dimensions ──
+            arr = restore_original_frame(arr, orig_w, orig_h)
+            frames.append(arr)
 
         if not out:
             out = vdna.replace('.vdna', '_reconstructed.mp4')
 
-        # Use saved sample rate to get correct playback speed
         fps         = meta.get('fps', 30)
         sample_rate = meta.get('sample_rate', FRAME_SAMPLE)
         out_fps     = fps / sample_rate
 
         clip = ImageSequenceClip(frames, fps=out_fps)
         clip.write_videofile(out, verbose=False, logger=None)
+        if orig_w and orig_h:
+            print(f"  Restored:      {orig_w}×{orig_h} per frame")
         print(f"  Reconstructed: {out}")
         print(f"  Duration:      {len(frames)/out_fps:.1f}s")
         return out
@@ -912,7 +953,6 @@ class System:
             rec = self.f.decode(g, r, d)
             arr = (torch.clamp(rec,0,1).squeeze(0)
                    .permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
-            # Use mean of all 3 channels — richer reconstruction
             samples = (
                 arr.mean(axis=2).flatten().astype(np.float32)
                 / 255.0 * 2 - 1
@@ -935,16 +975,9 @@ class System:
         print(f"  Duration:      {len(combined)/1000:.1f}s")
         return out
 
-    # ── FULL DEMO — compress + reconstruct + compare ──
+    # ── FULL DEMO ─────────────────────────────
 
     def demo(self, path, encrypt=True):
-        """
-        Full demo for any file:
-        1. Compress to DNA
-        2. Reconstruct from DNA
-        3. Show 3-stage progression (images only)
-        4. Save comparison image
-        """
         if not os.path.exists(path):
             print(f"File not found: {path}")
             return
@@ -959,17 +992,15 @@ class System:
         print(f"Type: {ftype.upper()}")
         print(f"{'='*55}")
 
-        # Step 1 — Compress
         print(f"\nSTEP 1 — COMPRESS")
         start   = time.time()
         dna     = self.compress(path, encrypt=encrypt)
         elapsed = time.time() - start
         if not dna:
             return
-        dsz     = os.path.getsize(dna)
+        dsz = os.path.getsize(dna)
         print(f"  Time: {elapsed:.2f}s")
 
-        # Step 2 — Reconstruct
         print(f"\nSTEP 2 — RECONSTRUCT")
         out_path = f"{name}_reconstructed"
         if dna.endswith('.vdna'):
@@ -979,30 +1010,23 @@ class System:
         else:
             out_path += '.png'
 
-        start  = time.time()
-        result = self.reconstruct(dna, "full", out_path)
+        start   = time.time()
+        result  = self.reconstruct(dna, "full", out_path)
         elapsed = time.time() - start
         print(f"  Time: {elapsed:.2f}s")
 
-        # Step 3 — Progression + Comparison (images only)
         if ftype == 'image':
             print(f"\nSTEP 3 — PROGRESSION & COMPARISON")
             t       = self.img_tensor(path)
             g, r, d = self.f.encode(t)
             r0, d0  = torch.zeros_like(r), torch.zeros_like(d)
-
-            s1  = self.f.decode(g, r0, d0)  # global only
-            s2  = self.f.decode(g, r,  d0)  # global + regional
-            s3  = self.f.decode(g, r,  d)   # all 3 chains
-            rec = self.f.decode(g, r,  d)
-
+            s1  = self.f.decode(g, r0, d0)
+            s2  = self.f.decode(g, r,  d0)
+            s3  = self.f.decode(g, r,  d)
             comp_path = f"{name}_comparison.png"
-            make_comparison(path, rec, s1, s2, s3, s3, comp_path)
+            make_comparison(path, s3, s1, s2, s3, comp_path)
             print(f"  Comparison: {comp_path}")
-            print(f"  Columns: Original | "
-                  f"Global-32 | Regional-288 | Full-800 | Reconstructed")
 
-        # Summary
         print(f"\n{'='*55}")
         print(f"  Original:  {orig/1024/1024:.3f} MB")
         print(f"  DNA:       {dsz/1024:.2f} KB")
@@ -1014,24 +1038,21 @@ class System:
 
     # ── PROGRESSIVE — Claim 8 ─────────────────
 
-    def progressive(self, image_path, out="progressive_comparison.png"):
+    def progressive(self, image_path,
+                    out="progressive_comparison.png"):
         t       = self.img_tensor(image_path)
         g, r, d = self.f.encode(t)
         r0, d0  = torch.zeros_like(r), torch.zeros_like(d)
         s1      = self.f.decode(g, r0, d0)
         s2      = self.f.decode(g, r,  d0)
         s3      = self.f.decode(g, r,  d)
-        make_comparison(image_path, s3, s1, s2, s3, s3, out)
+        make_comparison(image_path, s3, s1, s2, s3, out)
         print(f"  Progressive: {out}")
         return out
 
     # ── BATCH ─────────────────────────────────
 
     def batch(self, paths, chunk_size=32):
-        """
-        Batch compress images.
-        Processes in chunks to avoid memory issues.
-        """
         to, td, out = 0, 0, []
         for chunk_start in range(0, len(paths), chunk_size):
             chunk   = paths[chunk_start:chunk_start+chunk_size]
@@ -1104,32 +1125,19 @@ class System:
 # ── RUN ──────────────────────────────────────
 
 if __name__ == "__main__":
-    """
-    Usage:
-      python foundation_v4.py                  — run full demo on demo.png
-      python foundation_v4.py photo.jpg        — demo on any image
-      python foundation_v4.py video.mp4        — demo on any video
-      python foundation_v4.py audio.mp3        — demo on any audio
-      python foundation_v4.py document.pdf     — demo on any document
-      python foundation_v4.py --all            — run all claims demo
-    """
     try:
         s = System()
     except FileNotFoundError as e:
         print(f"\nError: {e}")
         sys.exit(1)
 
-    # Get input file from command line or default
     if len(sys.argv) > 1 and sys.argv[1] != '--all':
-        input_file = sys.argv[1]
-        s.demo(input_file)
+        s.demo(sys.argv[1])
 
     else:
-        # Full claims demo on demo.png
         print("\n=== FULL CLAIMS DEMO ===")
         s.demo("demo.png")
 
-        # Find and test any other files in folder
         test_files = [
             f for f in os.listdir('.')
             if (
@@ -1144,11 +1152,10 @@ if __name__ == "__main__":
             )
         ]
         if test_files:
-            print(f"\n=== OTHER FILES FOUND: {len(test_files)} ===")
+            print(f"\n=== OTHER FILES: {len(test_files)} ===")
             for f in test_files[:3]:
                 s.demo(f)
 
-        # Epigenetic modes — Claim 10
         if os.path.exists("demo.png.dna"):
             print("\n=== EPIGENETIC MODES (Claim 10) ===")
             dna = "demo.png.dna"
@@ -1162,14 +1169,13 @@ if __name__ == "__main__":
                       "epigenetic_mobile.png"]:
                 if os.path.exists(f): os.remove(f)
 
-        # Batch + federated + stream on training images
         training = []
         if os.path.exists("training_images"):
             training = [
                 os.path.join("training_images", f)
                 for f in os.listdir("training_images")
                 if f.endswith(('.jpg','.png'))
-            ][:100]  # limit to 100 for demo speed
+            ][:100]
 
         if training:
             print("\n=== BATCH (Claim 1) ===")
@@ -1189,9 +1195,8 @@ if __name__ == "__main__":
         print("\n=== THREE TIER (Claim 13) ===")
         s.tiers()
 
-        # Claims summary
         print("\n" + "="*45)
-        print("ALL CLAIMS ACTIVE — v5.3")
+        print("ALL CLAIMS ACTIVE — v5.4")
         print("="*45)
         for num, name in [
             ("1",  "Cross-file shared foundation"),
